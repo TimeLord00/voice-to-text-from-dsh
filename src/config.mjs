@@ -97,8 +97,8 @@ export const DEFAULTS = {
   pasteDelayMs: 120,
   /** Play the start/stop/result cues. They are synthesized here, not Windows sound-scheme entries. */
   beeps: true,
-  /** Loudness of those cues, 0..1. */
-  beepVolume: 0.7,
+  /** Loudness of those cues, 0..1. Halved from 0.7 after the user reported them too loud. */
+  beepVolume: 0.35,
   /**
    * Keep a copy of every recording in `recordings/`. Off by default: a dictation tool should not
    * leave the user's voice on disk unless asked. Turn it on when a result looks wrong.

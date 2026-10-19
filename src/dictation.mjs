@@ -8,7 +8,7 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { ROOT } from './config.mjs'
-import { Microphone, beep, copyText, foregroundWindowTitle, readClipboardText, sendPaste, tempRecordingPath } from './win32.mjs'
+import { Microphone, beep, copyText, cueStatus, foregroundWindowTitle, readClipboardText, sendPaste, tempRecordingPath } from './win32.mjs'
 import { canonicalToFloat, describeCanonical, speechActivity, toCanonicalWav } from './wav.mjs'
 import { explainNoSpeech } from './engine.mjs'
 
@@ -41,6 +41,8 @@ export class Dictation {
     this.previousClipboard = null
     this.onText = options.onText ?? null
     this.onState = options.onState ?? null
+    /** Set once, so a device that always refuses the cue does not spam the log. @type {boolean} */
+    this.cueProblemLogged = false
   }
 
   /**
@@ -65,6 +67,28 @@ export class Dictation {
     return this.state === DictationState.Recording
   }
 
+  /**
+   * Play one dictation cue, and say so when the audio device refuses it.
+   *
+   * A cue can go missing in two very different ways, and the log has to tell them apart: the device can
+   * refuse our buffer (then Windows' own scheme sound plays, which is itself silent when that scheme
+   * entry is set to (None)), or the buffer can play into an endpoint that is still waking up from power
+   * save. {@link playCue} handles the second case with a silent pre-roll; this records the first one.
+   * @param {'start'|'stop'|'done'|'error'} kind - which cue to play.
+   * @returns {boolean} whether our own cue played.
+   */
+  cue(kind) {
+    if (!this.beeps) return false
+    const played = beep(kind, this.config.beepVolume)
+    if (!played && !this.cueProblemLogged) {
+      this.cueProblemLogged = true
+      this.log(`! the audio device refused the ${kind} cue (${cueStatus().error ?? 'unknown reason'})`)
+      this.log('  the Windows system sound was used instead, and that is silent when its scheme entry is (None)')
+      this.log('  check the default output device in 声音设置; --no-beeps turns the cues off')
+    }
+    return played
+  }
+
   /** @returns {number} seconds recorded so far. */
   get elapsedSeconds() {
     return this.microphone?.elapsedSeconds ?? 0
@@ -84,7 +108,7 @@ export class Dictation {
     const captureMs = Date.now() - startedAt
     this.previousClipboard = this.clipboard ? readClipboardText() : null
     this.setState(DictationState.Recording)
-    if (this.beeps) beep('start', this.config.beepVolume)
+    this.cue('start')
     // How long the device took to start streaming: the user's "the first time it cannot hear me" is a
     // question about exactly this number, so it belongs in the log rather than in a support round trip.
     this.log(`● recording (max ${this.config.maxSeconds}s, capture live after ${captureMs}ms)`)
@@ -114,7 +138,7 @@ export class Dictation {
     try {
       if (seconds < this.config.minSeconds) {
         this.microphone.discard()
-        if (this.beeps) beep('error', this.config.beepVolume)
+        this.cue('error')
         throw new Error(`Recording was only ${seconds.toFixed(1)}s (shorter than ${this.config.minSeconds}s); ignored`)
       }
       const saved = this.microphone.save(path)
@@ -143,7 +167,7 @@ export class Dictation {
     const delivery = await this.deliver(result.text)
     this.setState(DictationState.Idle)
     this.lastResult = { ...result, ...delivery, format, peakDbfs }
-    if (this.beeps) beep(result.text ? 'done' : 'error', this.config.beepVolume)
+    this.cue(result.text ? 'done' : 'error')
     if (this.onText) this.onText(this.lastResult)
     return this.lastResult
   }
@@ -177,7 +201,7 @@ export class Dictation {
     this.microphone?.close()
     if (this.clipboard && this.previousClipboard !== null) copyText(this.previousClipboard)
     this.setState(DictationState.Idle)
-    if (this.beeps) beep('stop', this.config.beepVolume)
+    this.cue('stop')
     this.log(`✕ discarded ${seconds.toFixed(1)}s`)
     return { state: this.state, seconds }
   }

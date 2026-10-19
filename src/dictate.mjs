@@ -9,7 +9,7 @@
  */
 import { Dictation, warmUpMicrophone } from './dictation.mjs'
 import { MicButton } from './overlay.mjs'
-import { Hotkeys, beep } from './win32.mjs'
+import { Hotkeys, beep, warmUpAudio } from './win32.mjs'
 
 /**
  * Start the dictation loop.
@@ -43,6 +43,10 @@ export function runDictation(config, engine, options = {}) {
   engine.load()
   log(`model ready in ${((Date.now() - started) / 1000).toFixed(1)}s (${config.precision}${config.language ? `, ${config.language}` : ''})`)
   if (options.warmUpMicrophone !== false) warmUpMicrophone(log)
+  // Wake the output device too: an endpoint that has been idle plays the first 100-300 ms into a device
+  // that is still starting up, and that is long enough to swallow a whole cue (field report: "sometimes
+  // there is a sound, sometimes there is not"). A silent buffer here moves that cost off the first cue.
+  warmUpAudio()
 
   /** Start or stop, exactly as one press of the start/stop hotkey would. */
   const toggle = () => {

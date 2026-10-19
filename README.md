@@ -117,16 +117,20 @@ node .\bin\vtt.mjs serve --port 8791
 | `ctrl+alt+escape` | 放弃这次录音（不识别，并还原剪贴板） |
 | `Ctrl+C`（在该终端窗口） | 退出 |
 
-听写有四个提示音，都是本项目自己合成的（不是 Windows 声音方案里的那几个，所以不会和别的软件撞声）：
+听写有四个提示音，都是本项目自己合成的（不是 Windows 声音方案里的那几个，所以不会和别的软件撞声）。音色是**水滴**：一个音高快速上滑、音量指数衰减的短音（起音处带一点低通噪声，就是水滴落在水面那声「嘀」）：
 
 | 声音 | 什么时候响 | 听感 |
 | --- | --- | --- |
-| 开始 | 开始录音 | 两声上行（E5 → A5），146 ms |
-| 结束 | 你按下结束后，正在识别 | 一声低音（G4），90 ms |
-| 完成 | 识别出文字、已粘贴 | 三声快速上行（E5 → G5 → C6），162 ms |
-| 失败 | 识别为空，或录音太短被丢弃 | 两声下行（A4 → F4），233 ms |
+| 开始 | 开始录音 | 一滴水（520 → 1180 Hz 上滑），150 ms |
+| 结束 | 你按下结束后，正在识别 | 一滴更低的水（300 → 620 Hz），130 ms |
+| 完成 | 识别出文字、已粘贴 | 两滴水，第二滴更高（「嘀-嘀↑」），332 ms |
+| 失败 | 识别为空，或录音太短被丢弃 | 一声闷闷的下滑（430 → 235 Hz，几乎没有高频），210 ms |
 
-`--no-beeps` 关掉全部提示音，`--beep-volume 0..1`（配置项 `beepVolume`，默认 0.7）只调音量。想先听听：`node probe\cue-check.mjs` 会把四个 wav 写到 `test-output\cues\`，双击即可试听。喇叭被静音或没有输出设备时，会自动退回 Windows 默认提示音，不会没声音也不报错。
+失败音故意不放在「水滴」这一族里：下滑的闷音是水滴唯一不会撞上的形状。音量默认 **0.35**（第一版是 0.7，实测用户觉得太响，砍了一半；峰值约 -12 dBFS）。
+
+`--no-beeps` 关掉全部提示音，`--beep-volume 0..1`（配置项 `beepVolume`）只调音量。想先听听：`node probe\cue-check.mjs` 会把四个 wav 写到 `test-output\cues\`，双击即可试听。
+
+**为什么有时候响、有时候不响？** 输出设备闲置一段时间后会进省电，播放头 100~300 ms 是喂给一个还在启动的设备，而一滴水只有 130~330 ms —— 整声被吃掉是完全可能的。所以提示音在静默超过 6 秒后会**先播 60 ms 静音把它叫醒**，再播提示音（合并成一个缓冲区，只打开一次设备，实测 311 ms 而不是 407 ms）；启动时也会先叫醒一次，让「第一次按」的那声不丢。实测在这台机器上 `PlaySound` 在所有状态下（空闲、录音中、刚关麦）**都返回成功**，所以「没声音」不是播放失败，而是设备唤醒或音量/输出设备的朝向问题。真的被设备拒绝时（`playCue` 返回 false）会退回 Windows 默认提示音，并在日志里写一行 `! the audio device refused the ... cue` —— 那行出现才说明是播放失败，没出现就是你听不到而已。
 
 ---
 
@@ -230,7 +234,7 @@ vtt config  [--init] [--force] [--json]
 | `--json` | 关 | 输出机器可读的 JSON |
 | `--model-dir` / `--vad-path` | 自动 | 手动指定模型位置 |
 | `--speech-margin-db` / `--min-speech-frames` | `16` / `4` | 一段录音里 20 ms 帧要**连续**多少帧高出自身底噪多少 dB，才值得送去识别（`4` 帧 = 80 ms；另有 10 dB / 480 ms 的放宽档兜住又轻又长的整句话）。设 `--speech-margin-db 0` 关掉这道闸门（静音也照解码，用来看模型到底「听」到了什么） |
-| `--beeps` / `--beep-volume` | 开 / `0.7` | 四个自定义提示音的开关与音量（0..1）；`node probe\cue-check.mjs` 可以把它们导出成 wav 试听 |
+| `--beeps` / `--beep-volume` | 开 / `0.35` | 四个自定义水滴提示音的开关与音量（0..1）；`node probe\cue-check.mjs` 可以把它们导出成 wav 试听 |
 | `--keep-recordings` | 关 | 把每次录音留一份到 `recordings\` 用于排查（也支持 `VTT_KEEP_RECORDINGS=1`） |
 
 退出码：`0` 成功，`1` 运行错误，`3` 没识别到内容，`4` 模型缺失，`5` 自检发现问题。
@@ -318,7 +322,7 @@ Get-ChildItem *.wav | ForEach-Object { vtt transcribe $_.FullName --json }
   "minSeconds": 0.6,
   "pasteDelayMs": 120,
   "beeps": true,
-  "beepVolume": 0.7,
+  "beepVolume": 0.35,
   "speechMarginDb": 16,
   "minSpeechFrames": 4,
   "keepRecordings": false,
@@ -351,7 +355,7 @@ Get-ChildItem *.wav | ForEach-Object { vtt transcribe $_.FullName --json }
 | `minSeconds` | 短于该时长视为误触，直接丢弃 |
 | `pasteDelayMs` | 粘贴前的等待毫秒数；某些应用需要更大值才能接住按键 |
 | `keepRecordings` | 把每次录音留一份到 `recordings\`，**只用于排查**「识别为空/识别错」；默认关闭，打开时启动横幅和每次结果都会明确写出来（`! recordings are being kept ...`）。也可用环境变量 `VTT_KEEP_RECORDINGS=1`（给双击快捷方式的场景用） |
-| `beeps` / `beepVolume` | 自定义提示音开关（默认开）与音量（默认 0.7，0..1） |
+| `beeps` / `beepVolume` | 自定义提示音开关（默认开）与音量（默认 0.35，0..1）。静默超过 6 秒后的第一声会先补 60 ms 静音唤醒输出设备，避免设备省电把整声吃掉 |
 | `speechMarginDb` / `minSpeechFrames` | 「值不值得送去识别」的闸门：20 ms 帧要高出该录音自身底噪多少 dB（默认 16）、并且**连续**多少帧做到（默认 4，即 80 ms）才算有人说话。防的是**静音乱说话**：模型会对着纯底噪编出一句通顺的中文，而悬浮按钮会把这句话粘进你正在写的东西里。另有放宽档（默认 10 dB 连续 480 ms）兜住又轻又长的整句话。设 `speechMarginDb` 为 0 关闭。房间安静时可下调到 12，短而轻的话就不容易被判成「没听到」 |
 | `token` | 设置后 HTTP 接口要求 `Authorization: Bearer <token>`（默认只监听 127.0.0.1） |
 | `overlay.size` / `gap` | 悬浮按钮的直径、与光标之间的间距（逻辑像素，会再乘以显示缩放） |
@@ -461,6 +465,7 @@ node .\bin\vtt.mjs listen --seconds 6      # 对着麦克风说“今天天气�
 | --- | --- |
 | `Cannot register the global hotkey ctrl+alt+space` | `vtt dictate` 会直接报错退出：该热键已被别的程序占用（本机上就是 DSH 语音输入插件）。换一个：`--hotkey ctrl+alt+d`。`vtt overlay` 不会因此罢工：日志里写一行、横幅标注 `unavailable`，**悬浮按钮照常工作** —— 按钮才是它的交互方式 |
 | 录制成功但识别为空 | 每次结果都会打印电平（`level -27.5 dBFS`）和闸门判词（`no-speech-activity`），接着两行测量细节：`longest run above +16 dB: 1 frame(s), 4 needed` 和两个结论之一 —— `nothing in it stands out from its own noise floor ... 看起来就是环境底噪`（麦克风没收到声音：静音、被 Windows 隐私设置拦截、默认输入设备选错、或离麦太远）或 `the voice detector still found N s of speech in it`（确实说了话，只是太轻，闸门差一点放过）。**第二种**就调 `--speech-margin-db 12`（房间很安静时也可以直接写进 config.json）重试，并把麦克风加强调高。要确诊就加 `--keep-recordings`：每次录音留在 `recordings\`，可以自己放来听、`node probe\wav-level.mjs <文件>` 看峰值/底噪、`node probe\gate-sweep.mjs <文件>` 看它在各档位下是否过关 |
+| 提示音有时响、有时不响 | 先看日志里有没有 `! the audio device refused the ... cue` 那一行：**有**就是设备真的拒绝了播放（输出被静音、没有输出设备、或那个进程够不到音频服务），此时会退回 Windows 默认提示音（若系统方案的对应项是「无」，那就真的没声）；**没有**就说明播放成功了，只是你听不到 —— 最可能是输出设备省电唤醒（本工具已在静默 6 秒后补 60 ms 静音唤醒，并把水滴音做到 130~330 ms，就是为了让整声活下来）、音量太小、或声音去了另一个输出设备（本机 winmm 报告 2 个输出设备，接耳机/显示器时容易走错）。用 `node probe\cue-device-probe.mjs` 可以把「空闲 / 录音中 / 刚关麦 / 连播四次」各状态下的播放返回值打出来 |
 | 什么都没说，却粘出来一句莫名其妙的话 | 这是模型对纯底噪的**幻觉**（SenseVoice 会对着静音编一句通顺的中文），由 `speechMarginDb` 闸门挡住：没有任何「连续 4 帧（80 ms）」高出底噪 16 dB、也没有「连续 480 ms 高出 10 dB」就不解码，直接报「没识别到」。这道闸门曾经松到 10 dB / 4 帧，结果本机最吵的那一阵底噪（+10 dB 上连续 240 ms）被解码成「花要来长的时候可以用。」—— 所以别把它调得太低。想亲眼看见幻觉：`vtt transcribe recordings\<那次录音>.wav --speech-margin-db 0` |
 | 粘贴没发生，但剪贴板有字 | 目标窗口是管理员权限（UIPI），手动 `Ctrl+V`；或把本工具也以管理员身份运行 |
 | 识别很慢 | 提高线程 `--threads 4`；或改用更短的录音；CPU 推理 1 秒音频通常远快于 1 秒 |
@@ -496,7 +501,7 @@ Silero VAD 切分 → SenseVoiceSmall (sherpa-onnx, CPU) → 文本
 几个刻意的设计取舍：
 
 - **不启动子进程**。录音、剪贴板、热键、按键注入、悬浮窗口全部通过 `koffi` 在本进程内直接调用 Win32 API。省掉 ffmpeg / PowerShell 依赖，冷启动更快，也不会与受限环境的子进程策略冲突。（唯一的例外是测试：死锁那种「同步调用不返回」的故障没法在自己进程里超时，所以 `test:audio` 用一个带超时的子进程去证明它没卡住。）
-- **提示音同步播放，而且是自己合成的**。四个提示音由 `src/sound.mjs` 生成几毫秒粒度的 WAV 内存镜像，用 `PlaySound(SND_MEMORY)` **阻塞**播放完再返回。异步播放（`SND_ASYNC`）配上 MCI 录音会死锁，同步的代价只有 90-233 ms；音量可调、可整体关闭，设备拒收时退回系统提示音，所以反馈永远不会静默消失。
+- **提示音同步播放，而且是自己合成的**。四个提示音由 `src/sound.mjs` 生成几毫秒粒度的 WAV 内存镜像，用 `PlaySound(SND_MEMORY)` **阻塞**播放完再返回。异步播放（`SND_ASYNC`）配上 MCI 录音会死锁，同步的代价只有 130-330 ms；音色是水滴（音高上滑 + 指数衰减），比第一版的纯正弦音柔和得多，音量砍半到 0.35，可调、可整体关闭。设备拒收时退回系统提示音，并把「设备拒收」写进日志；设备只是睡着了（闲置 6 秒以上）则先播 60 ms 静音叫醒它 —— 见上面「为什么有时候响、有时候不响」那一条。
 - **窗口是「分层窗口」而不是普通窗口**：`WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`，用 `UpdateLayeredWindow` 逐像素画抗锯齿的圆和麦克风图形，鼠标命中由每条 `WM_MOUSEMOVE` 自己算。`WS_EX_NOACTIVATE` 是关键 —— 点按钮**不会抢走焦点**，否则「粘贴到光标处」就无从谈起（焦点一丢，光标就没了）。同一个窗口还带一个 `HTCLIENT` + `MA_NOACTIVATE` 的命中测试，确保点击不会激活它。
 - **画在哪儿不猜**：`GetGUIThreadInfo` 读前台线程的插入符矩形（拿不到就退到鼠标位置），只在光标旁边画。
 - **消息处理不在回调里干活**：窗口过程只记录发生了什么，录音和识别放到下一个事件循环 tick（见上面的崩溃说明）。
@@ -546,7 +551,7 @@ voice-to-text/
 └─ .gitignore                   依赖、模型、录音、日志、本地配置都不入库
 ```
 
-`probe/` 里的脚本不是产品的一部分，但都保留着：它们是本项目所有结论的**证据**——MCI 只接受 48 kHz/16-bit/立体声、`Shell_NotifyIcon` 在低完整性会话里返回 5、合成鼠标事件不可信、`koffi.view` 返回的是 `ArrayBuffer`、`koffi.decode(buf, 0, 'str16')` 会崩溃、异步 `PlaySound` 会让 MCI 的 `record` 永远不返回、模型把纯底噪标成 `<|Speech|>`、提示音会漏进录音且底噪会漂移，等等，都是先写一个几十行的探针量出来的。想复核某个结论时，直接跑对应的探针即可（`wav-level.mjs` 量电平、`gate-sweep.mjs` 扫闸门档位、`sensevoice-fields.mjs` 打印模型原始输出字段、`cue-capture-probe.mjs` 验提示音与录音的互斥、`who-is-button.mjs` 查悬浮窗归属、`mic-latency.mjs` 量录音启动耗时）。
+`probe/` 里的脚本不是产品的一部分，但都保留着：它们是本项目所有结论的**证据**——MCI 只接受 48 kHz/16-bit/立体声、`Shell_NotifyIcon` 在低完整性会话里返回 5、合成鼠标事件不可信、`koffi.view` 返回的是 `ArrayBuffer`、`koffi.decode(buf, 0, 'str16')` 会崩溃、异步 `PlaySound` 会让 MCI 的 `record` 永远不返回、模型把纯底噪标成 `<|Speech|>`、提示音会漏进录音且底噪会漂移，等等，都是先写一个几十行的探针量出来的。想复核某个结论时，直接跑对应的探针即可（`wav-level.mjs` 量电平、`gate-sweep.mjs` 扫闸门档位、`sensevoice-fields.mjs` 打印模型原始输出字段、`cue-capture-probe.mjs` 验提示音与录音的互斥、`cue-device-probe.mjs` 量各状态下提示音的播放返回值、`who-is-button.mjs` 查悬浮窗归属、`mic-latency.mjs` 量录音启动耗时）。
 
 ---
 

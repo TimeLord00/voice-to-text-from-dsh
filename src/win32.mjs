@@ -18,7 +18,7 @@ import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import koffi from 'koffi'
-import { CUE_KINDS, DEFAULT_CUE_VOLUME, renderCue } from './sound.mjs'
+import { CUE_KINDS, DEFAULT_CUE_VOLUME, SAMPLE_RATE, cueSamples, encodePcm16Wav, renderCue } from './sound.mjs'
 
 /** MCI recording format: the only one the waveaudio mapper accepts here. */
 export const MIC_FORMAT = { sampleRate: 48000, channels: 2, bitsPerSample: 16 }
@@ -33,6 +33,21 @@ const SND_NODEFAULT = 0x0002
 const SND_MEMORY = 0x0004
 /** Rendered cue images, keyed by `kind@volume`: rendering per click would be wasted work. */
 const cueCache = new Map()
+/**
+ * How long the output device is trusted to stay awake. An audio endpoint that has been idle goes into
+ * power save; the first 100-300 ms written to it are then played into a device that is still waking up,
+ * and a 130-330 ms cue can disappear entirely — which is what "sometimes there is a sound, sometimes
+ * there is not" looks like from the outside. Measured on this machine: every PlaySound call returns 1 in
+ * every state (idle, while the recorder runs, right after it closes), so a refusal is not the cause of
+ * that report; the wake-up is.
+ */
+const CUE_WAKE_MS = 6000
+/** Length of the silent pre-roll that absorbs the wake-up. */
+const CUE_WAKE_TAIL_MS = 60
+/** @type {Buffer|null} 60 ms of silence, played before a cue after a long quiet stretch. */
+let wakeBuffer = null
+/** @type {{at: number, error: string|null}} what the cue path last did, for diagnostics. */
+const cueState = { at: 0, error: null }
 const MOD_ALT = 0x0001
 const MOD_CONTROL = 0x0002
 const MOD_SHIFT = 0x0004
@@ -498,6 +513,46 @@ export function foregroundWindowTitle() {
 }
 
 /**
+ * The silent buffer played at start-up. Silence costs nothing audibly and the device leaves power save
+ * while it is being played, so the first cue of a session is not the one that pays for the wake-up.
+ * @returns {Buffer} WAV bytes of {@link CUE_WAKE_TAIL_MS} milliseconds of silence.
+ */
+function wakeupBuffer() {
+  if (!wakeBuffer) {
+    wakeBuffer = encodePcm16Wav(new Float32Array(Math.round((CUE_WAKE_TAIL_MS * SAMPLE_RATE) / 1000)), SAMPLE_RATE)
+  }
+  return wakeBuffer
+}
+
+/**
+ * The same cue with silence in front of it, for the first cue after an idle stretch: one buffer means one
+ * open of the output device, which is worth about 90 ms of blocking compared with playing two buffers.
+ * @param {string} kind - cue name.
+ * @param {number} volume - 0..1 peak scale.
+ * @returns {Buffer} WAV bytes: {@link CUE_WAKE_TAIL_MS} ms of silence followed by the cue.
+ */
+function cueWithLead(kind, volume) {
+  const samples = cueSamples(kind, { volume })
+  const lead = Math.round((CUE_WAKE_TAIL_MS * SAMPLE_RATE) / 1000)
+  const padded = new Float32Array(lead + samples.length)
+  padded.set(samples, lead)
+  return encodePcm16Wav(padded, SAMPLE_RATE)
+}
+
+/**
+ * Bring the output device out of power save without making a sound. Called once at start-up so that the
+ * very first start cue is not the one that pays for waking the endpoint up.
+ * @returns {boolean} whether the device accepted the buffer.
+ */
+export function warmUpAudio() {
+  try {
+    return native().PlaySoundW(wakeupBuffer(), null, SND_MEMORY | SND_NODEFAULT) !== 0
+  } catch {
+    return false
+  }
+}
+
+/**
  * Play one of the synthesized dictation cues (see src/sound.mjs).
  *
  * **Blocking, deliberately** (no `SND_ASYNC`). Measured on this machine: an asynchronous PlaySound that
@@ -506,7 +561,11 @@ export function foregroundWindowTitle() {
  * on the very first try (`vtt listen` played its start cue, printed "recording", then hung forever).
  * `probe/cue-capture-probe.mjs` walks one playback technique per mode through a real recording; every
  * asynchronous variant deadlocks, every blocking variant completes, whether the cue precedes the
- * recorder or plays while it is already running. A cue is 90-233 ms, so blocking costs at most that.
+ * recorder or plays while it is already running. A cue is 130-330 ms, so blocking costs at most that.
+ *
+ * After {@link CUE_WAKE_MS} of silence the endpoint is assumed to be in power save, so a silent pre-roll
+ * is played first and the cue gets a live device. A refusal is retried once before giving up, because a
+ * device that is still waking up can reject the very first buffer.
  * @param {'start'|'stop'|'done'|'error'} kind - which cue to play.
  * @param {number} [volume] - 0..1 peak scale, default {@link DEFAULT_CUE_VOLUME}.
  * @returns {boolean} whether the audio device accepted the buffer.
@@ -514,16 +573,36 @@ export function foregroundWindowTitle() {
 export function playCue(kind, volume = DEFAULT_CUE_VOLUME) {
   if (!CUE_KINDS.includes(kind)) return false
   const key = `${kind}@${volume}`
-  let wav = cueCache.get(key)
+  const idle = Date.now() - cueState.at
+  const wake = cueState.at === 0 || idle > CUE_WAKE_MS
+  const cacheKey = wake ? `lead:${key}` : key
+  let wav = cueCache.get(cacheKey)
   if (!wav) {
-    wav = renderCue(kind, { volume })
-    cueCache.set(key, wav)
+    wav = wake ? cueWithLead(kind, volume) : renderCue(kind, { volume })
+    cueCache.set(cacheKey, wav)
   }
   try {
-    return native().PlaySoundW(wav, null, SND_MEMORY | SND_NODEFAULT) !== 0
-  } catch {
+    const play = native().PlaySoundW
+    cueState.woke = wake
+    let ok = play(wav, null, SND_MEMORY | SND_NODEFAULT) !== 0
+    if (!ok) ok = play(wav, null, SND_MEMORY | SND_NODEFAULT) !== 0
+    cueState.error = ok ? null : 'the audio device refused the cue'
+    if (ok) cueState.at = Date.now()
+    return ok
+  } catch (error) {
+    cueState.error = error?.message ?? String(error)
     return false
   }
+}
+
+/**
+ * What the cue path last did. Diagnostics only: the dictation log uses it to tell "the device refused
+ * the sound" apart from "the sound played but nobody heard it".
+ * @returns {{at: number, woke: boolean, error: string|null}} `at` is when a cue last played, `woke` is
+ *   whether the last call needed the wake-up pre-roll, `error` is the last refusal.
+ */
+export function cueStatus() {
+  return { at: cueState.at, woke: Boolean(cueState.woke), error: cueState.error }
 }
 
 /**
@@ -534,17 +613,20 @@ export function playCue(kind, volume = DEFAULT_CUE_VOLUME) {
  * These are our own synthesized cues rather than Windows sound-scheme entries, because the scheme sounds
  * are configurable, generic and (with `MessageBeep`) impossible to tell apart from any other program's.
  * When the device refuses the buffer — a muted output, no audio endpoint at all — the system sound is
- * used instead so feedback is never silently lost.
+ * used instead so feedback is never silently lost; note that the system sound is *also* silent when the
+ * matching scheme entry is set to (None), which is why the return value is reported to the caller.
  * @param {'start'|'stop'|'done'|'error'} kind - which sound to play.
  * @param {number} [volume] - 0..1, see {@link playCue}.
- * @returns {void}
+ * @returns {boolean} `true` when our own cue played, `false` when it fell back to the system sound.
  */
 export function beep(kind, volume = DEFAULT_CUE_VOLUME) {
-  if (kind !== 'off' && playCue(kind, volume)) return
+  if (kind !== 'off' && playCue(kind, volume)) return true
   const types = { start: 0x40, stop: 0x30, done: 0x40, error: 0x10 }
   try {
     native().MessageBeep(types[kind] ?? 0x40)
   } catch {
     // Feedback is best-effort: a missing sound scheme must never break dictation.
   }
+  return false
 }
+

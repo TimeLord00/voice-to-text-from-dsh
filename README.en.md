@@ -102,7 +102,7 @@ Common flags: `--language zh|en|yue|ja|ko|auto`, `--no-paste` (clipboard only), 
   "minSeconds": 0.6,
   "pasteDelayMs": 120,
   "beeps": true,
-  "beepVolume": 0.7,
+  "beepVolume": 0.35,
   "speechMarginDb": 16,
   "minSpeechFrames": 4,
   "keepRecordings": false,
@@ -144,9 +144,20 @@ Row two is why the strict margin is 16 dB and not the 10 dB this started with: a
 
 ## Feedback sounds
 
-The four cues (start, stop, done, error) are synthesized by this project rather than borrowed from the Windows sound scheme, so they cannot be confused with another program's notifications and do not change with the user's scheme. Play them yourself with `node probe/cue-check.mjs`, which writes them to `test-output/cues/`. `--no-beeps` silences them, `--beep-volume 0..1` (default 0.7) changes how loud they are; if the output device refuses the buffer, the tool falls back to the plain Windows sound instead of going silent.
+The four cues (start, stop, done, error) are synthesized by this project rather than borrowed from the Windows sound scheme, so they cannot be confused with another program's notifications and do not change with the user's scheme. The timbre is a **water drop**: a fast upward pitch glide with an exponential decay and a touch of low-passed noise at the attack.
 
-They are also played **synchronously**, which is not an accident: with `SND_ASYNC`, a cue still playing when the MCI mapper opens the capture device makes `mciSendStringW('record')` never return — the process freezes with no error, no log line and no way out but Task Manager (`vtt listen` reproduced it on the first run). `probe/cue-capture-probe.mjs` walks one playback technique per mode through a real recording: every asynchronous variant deadlocks, every blocking variant completes. Blocking costs at most 233 ms, and `npm test` runs the probe in a child process with a timeout, so a hang fails the suite instead of hanging it.
+| cue | when | sound | length |
+| --- | --- | --- | --- |
+| start | recording begins | one drop, 520 → 1180 Hz | 150 ms |
+| stop | you stopped, transcription runs | a lower drop, 300 → 620 Hz | 130 ms |
+| done | text recognized and pasted | two drops, the second higher | 332 ms |
+| error | nothing recognized, or a too-short recording | one muffled downward glide (430 → 235 Hz), deliberately outside the drop family | 210 ms |
+
+Volume defaults to **0.35** (about -12 dBFS peak; the first release used 0.7 and was reported as too loud). Play them yourself with `node probe/cue-check.mjs`, which writes them to `test-output/cues/`. `--no-beeps` silences them, `--beep-volume 0..1` changes how loud they are.
+
+**Why a cue sometimes does not play.** After an idle stretch the output device is asleep, and the first 100-300 ms of playback is spent feeding a device that is still waking up — a 130-330 ms drop can be swallowed whole. So a cue that follows more than 6 seconds of silence is preceded by **60 ms of silence in the same buffer**, which wakes the device while costing nothing audible (one device open instead of two: measured 311 ms instead of 407 ms), and the start of a session warms the device too. `playCue` reports its result, so a cue the device actually refused (`! the audio device refused the ... cue` in the log) falls back to the plain Windows sound, while a cue that played but was not heard is a device/volume/routing question rather than a failure. `probe/cue-device-probe.mjs` prints the playback result in every state (idle, while recording, right after closing the microphone, four in a row).
+
+They are also played **synchronously**, which is not an accident: with `SND_ASYNC`, a cue still playing when the MCI mapper opens the capture device makes `mciSendStringW('record')` never return — the process freezes with no error, no log line and no way out but Task Manager (`vtt listen` reproduced it on the first run). `probe/cue-capture-probe.mjs` walks one playback technique per mode through a real recording: every asynchronous variant deadlocks, every blocking variant completes. Blocking costs at most 330 ms, and `npm test` runs the probe in a child process with a timeout, so a hang fails the suite instead of hanging it.
 
 ## Verified on
 
@@ -165,6 +176,7 @@ Two honest caveats: `Shell_NotifyIcon` is refused with `error 5` inside low-inte
 | The button is gone | It does not hide by itself; check `overlay.log` and Task Manager for a leftover `node.exe`. A second launch revives a running button. |
 | `overlay --stop` says the button cannot be reached | It belongs to another user or a higher privilege level (UIPI blocks the message). `node probe\who-is-button.mjs` prints the owning PID; end that `node.exe` in Task Manager. |
 | Nothing happens after double-clicking the shortcut | Read `overlay.log` — the first line is a build stamp (version + source mtime), which tells a fresh process apart from an old one. |
+| A cue plays only sometimes | Check the log first: `! the audio device refused the ... cue` means playback was genuinely refused (muted output, no render device, or a process that cannot reach the audio service) and the plain Windows sound takes over — which can itself be set to "(None)". No such line means the cue played and was simply not heard: an output device waking from power save (the tool now prepends 60 ms of silence after 6 s of quiet and keeps drops at 130-330 ms), a low volume slider, or sound routed to another output device (winmm reports two render devices on this machine; headsets and monitors are easy to pick wrongly). |
 | Text lands in the wrong window | Click into the target field first: the paste goes to whatever holds the focus when the recording stops. |
 
 ## License and credits

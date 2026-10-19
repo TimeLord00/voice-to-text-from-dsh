@@ -1,41 +1,66 @@
 /**
- * The four dictation cues, synthesized instead of borrowed from the Windows sound scheme.
+ * The four dictation cues, synthesized as water drops instead of borrowed from the Windows sound scheme.
  *
  * `MessageBeep` can only play the sounds the user picked in 控制面板 -> 声音, so a dictation tool built on
  * it sounds exactly like every other Windows program. These cues are generated here as ordinary PCM, so
- * they are recognizable, distinguishable from each other and identical on every machine:
+ * they are recognizable, distinguishable from each other and identical on every machine.
  *
- *   start  two rising notes        "I am listening now"
- *   stop   one low note            "I have your recording"
- *   done   three quick rising notes "here is your text"
- *   error  two falling notes       "nothing came back"
+ * The family is a **water drop**: a short sine whose pitch glides upward while its amplitude decays
+ * exponentially, plus a whisper of low-passed noise at the onset for the "plip" of the surface. Field
+ * feedback drove this choice — plain sine notes at 660-1050 Hz were reported as 尖 (shrill) and too
+ * loud, and a drop is both softer and unmistakable:
  *
- * Every cue is a few sine partials with a soft attack and a cosine tail, which is what keeps them from
- * clicking at the edges. Nothing here touches Win32: {@link renderCue} returns WAV bytes and
- * src/win32.mjs plays them through PlaySound with SND_MEMORY.
+ *   start  one drop                 "I am listening now"
+ *   stop   one deeper drop          "I have your recording"
+ *   done   two drops, the second higher "here is your text"
+ *   error  one flat falling bloop   "nothing came back"
+ *
+ * The error cue deliberately leaves the water family: a descending, muted tone is the one shape a drop
+ * cannot be confused with.
+ *
+ * Nothing here touches Win32: {@link renderCue} returns WAV bytes and src/win32.mjs plays them through
+ * PlaySound with SND_MEMORY.
  */
 
 /** Cue sample rate. 44.1 kHz keeps the partials clean and every audio device accepts it. */
 export const SAMPLE_RATE = 44100
 
-/** Default loudness, 0..1, of the loudest cue peak. Chosen so a cue is clearly audible but not jarring. */
-export const DEFAULT_CUE_VOLUME = 0.7
-
-/** Note names used below, in Hz. */
-const NOTES = {
-  g4: 392.0, a4: 440.0, f4: 349.23,
-  e5: 659.25, g5: 783.99, a5: 880.0, c6: 1046.5,
-}
+/**
+ * Default loudness, 0..1, of the loudest cue peak. Halved from the first release (0.7 -> 0.35) after the
+ * user reported the cues were too loud; a cue at 0.35 peaks near -10 dBFS, which is clearly audible over
+ * room tone without being startling.
+ */
+export const DEFAULT_CUE_VOLUME = 0.35
 
 /**
- * Cue definitions: a list of `[frequency, milliseconds]` notes and the gap between them.
- * @type {Record<string, {notes: [number, number][], gapMs: number, gain: number}>}
+ * One synthesized voice. The pitch glides geometrically from `from` to `to` over `ms`, the amplitude
+ * decays as `exp(-decay * progress)`, `partials` are `[frequencyMultiple, gain]` pairs and `noise` is the
+ * gain of the low-passed transient that gives a drop its attack.
+ * @typedef {{from: number, to: number, ms: number, gain: number, decay: number,
+ *   partials: [number, number][], noise?: number}} Voice
+ */
+
+/** A falling drop: the pitch rises, the level drops fast. Used for "start". @type {Voice} */
+const DROP = { from: 520, to: 1180, ms: 150, gain: 0.85, decay: 3.2, partials: [[1, 1], [2.7, 0.18], [4.3, 0.05]], noise: 0.045 }
+
+/** The same shape an octave down: a bigger drop landing. @type {Voice} */
+const DEEP_DROP = { from: 300, to: 620, ms: 130, gain: 0.8, decay: 2.6, partials: [[1, 1], [2.4, 0.16]], noise: 0.03 }
+
+/** A smaller, higher drop for the second half of "done". @type {Voice} */
+const HIGH_DROP = { from: 700, to: 1650, ms: 170, gain: 0.8, decay: 3.4, partials: [[1, 1], [2.6, 0.16], [4, 0.04]], noise: 0.04 }
+
+/** Flat and falling, with almost no high content: the sound of "no". @type {Voice} */
+const PLOP = { from: 430, to: 235, ms: 210, gain: 0.7, decay: 1.6, partials: [[1, 1], [1.9, 0.12]], noise: 0.02 }
+
+/**
+ * Cue definitions: the voices to play in order, and the silence between them.
+ * @type {Record<string, {voices: Voice[], gapMs: number}>}
  */
 export const CUES = {
-  start: { notes: [[NOTES.e5, 55], [NOTES.a5, 85]], gapMs: 6, gain: 0.95 },
-  stop: { notes: [[NOTES.g4, 90]], gapMs: 0, gain: 0.8 },
-  done: { notes: [[NOTES.e5, 40], [NOTES.g5, 40], [NOTES.c6, 70]], gapMs: 6, gain: 0.95 },
-  error: { notes: [[NOTES.a4, 85], [NOTES.f4, 140]], gapMs: 8, gain: 0.8 },
+  start: { voices: [DROP], gapMs: 0 },
+  stop: { voices: [DEEP_DROP], gapMs: 0 },
+  done: { voices: [DROP, HIGH_DROP], gapMs: 12 },
+  error: { voices: [PLOP], gapMs: 0 },
 }
 
 /** Kinds accepted by {@link cueSamples}. */
@@ -49,7 +74,49 @@ export const CUE_KINDS = Object.keys(CUES)
 export function cueDurationMs(kind) {
   const cue = CUES[kind]
   if (!cue) throw new Error(`Unknown cue "${kind}"; expected one of ${CUE_KINDS.join(', ')}`)
-  return cue.notes.reduce((total, [, ms]) => total + ms, 0) + cue.gapMs * (cue.notes.length - 1)
+  return cue.voices.reduce((total, voice) => total + voice.ms, 0) + cue.gapMs * (cue.voices.length - 1)
+}
+
+/**
+ * Render one voice.
+ *
+ * The phase is integrated sample by sample rather than computed as `sin(2*pi*f*t)`, because the frequency
+ * changes while the note plays and a naive formula would tear the waveform apart at every step. The noise
+ * transient runs through a one-pole low-pass so the attack is a soft "plip" and not a click.
+ * @param {Voice} voice - see {@link CUES}.
+ * @param {number} sampleRate - output rate in Hz.
+ * @param {number} volume - 0..1 peak scale.
+ * @returns {Float32Array} mono samples in [-1, 1].
+ */
+function renderVoice(voice, sampleRate, volume) {
+  const length = Math.round((voice.ms * sampleRate) / 1000)
+  const out = new Float32Array(length)
+  const attack = Math.max(1, Math.round(sampleRate * 0.004))
+  const release = Math.max(1, Math.round(length * 0.25))
+  const ratio = voice.to / voice.from
+  const normalise = voice.partials.reduce((total, [, gain]) => total + gain, 0)
+  let phase = 0
+  let lowpass = 0
+  let seed = 0x2545f491
+  for (let index = 0; index < length; index += 1) {
+    const progress = index / (length - 1)
+    const frequency = voice.from * ratio ** progress
+    phase += (2 * Math.PI * frequency) / sampleRate
+    let value = 0
+    for (const [multiple, gain] of voice.partials) value += gain * Math.sin(phase * multiple)
+    if (voice.noise) {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff
+      const white = seed / 0x3fffffff - 1
+      lowpass += 0.3 * (white - lowpass)
+      value += voice.noise * lowpass * Math.exp(-progress * 14)
+    }
+    let envelope = Math.exp(-voice.decay * progress)
+    if (index < attack) envelope *= index / attack
+    const tail = length - index
+    if (tail < release) envelope *= 0.5 - 0.5 * Math.cos((Math.PI * tail) / release)
+    out[index] = (voice.gain * volume * envelope * value) / normalise
+  }
+  return out
 }
 
 /**
@@ -66,22 +133,11 @@ export function cueSamples(kind, options = {}) {
   const volume = Math.max(0, Math.min(1, options.volume ?? DEFAULT_CUE_VOLUME))
   const samples = new Float32Array(Math.round((cueDurationMs(kind) * sampleRate) / 1000) + 1)
   let offset = 0
-  for (const [frequency, ms] of cue.notes) {
-    const length = Math.round((ms * sampleRate) / 1000)
-    const attack = Math.max(1, Math.round(sampleRate * 0.003))
-    const release = Math.max(1, Math.min(Math.round(sampleRate * 0.03), Math.floor(length * 0.6)))
-    for (let index = 0; index < length; index += 1) {
-      const t = index / sampleRate
-      const partials = Math.sin(2 * Math.PI * frequency * t)
-        + 0.25 * Math.sin(4 * Math.PI * frequency * t)
-        + 0.07 * Math.sin(6 * Math.PI * frequency * t)
-      let envelope = 1
-      if (index < attack) envelope = index / attack
-      const tail = length - index
-      if (tail < release) envelope = Math.min(envelope, 0.5 - 0.5 * Math.cos((Math.PI * tail) / release))
-      samples[offset + index] += (cue.gain * volume * envelope * partials) / 1.32
-    }
-    offset += length + Math.round((cue.gapMs * sampleRate) / 1000)
+  const gap = Math.round((cue.gapMs * sampleRate) / 1000)
+  for (const voice of cue.voices) {
+    const rendered = renderVoice(voice, sampleRate, volume)
+    samples.set(rendered, offset)
+    offset += rendered.length + gap
   }
   return samples
 }

@@ -139,7 +139,9 @@ for (const kind of CUE_KINDS) {
   rendered[kind] = samples
   const ms = cueDurationMs(kind)
   const peak = samples.reduce((max, value) => Math.max(max, Math.abs(value)), 0)
-  check(`${kind}: 60-300 ms long`, ms >= 60 && ms <= 300, `${ms} ms`)
+  // 400 ms rather than 300: the water-drop cues are longer on purpose, so that a cue survives the
+  // 100-300 ms an output device needs to come out of power save.
+  check(`${kind}: 60-400 ms long`, ms >= 60 && ms <= 400, `${ms} ms`)
   check(`${kind}: audible but not clipped`, peak > 0.05 && peak <= 1, `peak ${peak.toFixed(3)}`)
   check(`${kind}: starts and ends near silence`, Math.abs(samples[0]) < 0.02 && Math.abs(samples[samples.length - 1]) < 0.02)
 }
@@ -176,13 +178,18 @@ function withClick(samples) {
 process.stdout.write('\ncue playback and the recorder\n')
 // The native layer is imported here rather than at the top so the pure checks above still run on a machine
 // where koffi cannot load.
-const { playCue } = await import('../src/win32.mjs')
+const { playCue, cueStatus, warmUpAudio } = await import('../src/win32.mjs')
 let playMs = -1
 let accepted = false
 try {
   const startedAt = Date.now()
-  accepted = playCue('start', 0.7)
+  // The first call of a session always takes the wake-up path, because no cue has played yet.
+  accepted = playCue('start', 0.35)
   playMs = Date.now() - startedAt
+  if (accepted) check('the first cue of a session wakes the output device first', cueStatus().woke === true)
+  const second = playCue('start', 0.35)
+  if (second) check('a cue right after another one skips the wake-up pre-roll', cueStatus().woke === false)
+  check('warmUpAudio plays the silent pre-roll without a cue', warmUpAudio() === true || !accepted)
 } catch (error) {
   note('cue playback', `the native call failed: ${error?.message ?? error}`)
 }
