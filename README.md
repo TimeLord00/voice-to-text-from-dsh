@@ -617,5 +617,7 @@ voice-to-text/
 | **koffi** | 调用 Win32 API 的 FFI | [Koromix/koffi](https://github.com/Koromix/koffi) | MIT |
 | 本项目源码 | 命令行、悬浮按钮、托盘、HTTP API | 见本仓库 | MIT（见 [LICENSE](LICENSE)） |
 
+> [LICENSE](LICENSE)（MIT）只覆盖本仓库的源码；工具运行时下载的**模型权重不在其中**，按各自上游许可分发（见上表）。权重文件从不进仓库：`vtt models --fetch` 按固定 URL 下载并校验 SHA-256，或者直接复用已有的 DSH 缓存。
+
 模型权重不入库：`vtt models --fetch` 按固定 URL 下载并校验 SHA-256，或直接复用你机器上已有的 DSH 缓存。
 本仓库不含任何第三方二进制，`npm install` 会拉取 `sherpa-onnx-node` 与 `koffi` 的官方预编译包。

@@ -213,4 +213,6 @@ Two honest caveats: `Shell_NotifyIcon` is refused with `error 5` inside low-inte
 | koffi | FFI used to call Win32 directly | [Koromix/koffi](https://github.com/Koromix/koffi) | MIT |
 | this project | CLI, floating button, tray, HTTP API | this repository | MIT — see [LICENSE](LICENSE) |
 
+> The [LICENSE](LICENSE) (MIT) covers this repository's source code only; the **model weights** the tool downloads are not covered by it and follow their own upstream licenses (table above).
+
 Model weights are never committed: `vtt models --fetch` downloads them from pinned URLs and verifies their SHA-256, or the tool reuses an existing DSH cache. No third-party binaries live in this repository.
