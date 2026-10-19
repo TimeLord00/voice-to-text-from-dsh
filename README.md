@@ -9,6 +9,8 @@
 
 识别内核与插件完全一致 —— **SenseVoiceSmall**（ONNX int8）+ **Silero VAD**，通过 **sherpa-onnx** 在本地 CPU 上运行。不上传音频、不联网、不需要账号，装好即用。
 
+> **和 DSH 的关系**：这是同一套识别内核的**独立实现** —— 不在 DSH 里运行、不包含 DSH 的代码、DSH 关掉也照常工作（`vtt doctor` 断言的正是本项目自带的依赖与模型）。唯一相关的一点是首次运行会直接复用 DSH 已经下载好的模型文件（`%USERPROFILE%\.dsh\speech-to-text\...`，省掉 240 MB 下载），没有就自己下（见[模型](#模型)）。仓库名里的 `from-dsh` 只记出处。
+
 > **录音不会留在磁盘上**：每次录音只写一个临时文件，转成 16 kHz 单声道后立刻删除，识别结果只存在于内存里；项目目录里不会出现任何 `.wav`。唯一的例外是你自己显式打开 `keepRecordings`（或 `--keep-recordings`）用于排查问题，见[配置](#配置)。
 
 > **剪贴板也不会被占用**：自动粘贴确实要经过剪贴板，但粘贴一完成就把你原来的内容放回去（原来没有内容就清空）；那一瞬间还会告诉 Windows「别记进 Win+V 历史、别上传云剪贴板」。见[剪贴板不会被占用](#剪贴板不会被占用)。
@@ -55,14 +57,16 @@
 一条命令装好（检查 Node → 装依赖 → 自检 → 建快捷方式）：
 
 ```powershell
-cd <你放这个项目的目录>\voice-to-text
+git clone https://github.com/TimeLord00/voice-to-text-from-dsh.git voice-to-text
+cd voice-to-text
 .\install.ps1              # 加 -AddToPath 可把 bin 目录写进用户 PATH
 ```
 
 也可以手动执行：
 
 ```powershell
-cd <你放这个项目的目录>\voice-to-text
+git clone https://github.com/TimeLord00/voice-to-text-from-dsh.git voice-to-text
+cd voice-to-text
 
 # 1) 安装依赖（两个原生依赖，均已内置 Windows x64 二进制）
 npm install --cache .\.npm-cache --ignore-scripts

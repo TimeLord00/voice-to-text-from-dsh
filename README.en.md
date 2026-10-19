@@ -11,6 +11,8 @@ Plus `vtt listen` (one-shot), `vtt transcribe file.wav` (batch) and `vtt serve` 
 
 Recognition is **fully local**: SenseVoiceSmall (ONNX int8) + Silero VAD through sherpa-onnx on the CPU. No audio leaves the machine, no account, no network once the model is in place.
 
+> **Relation to DSH:** this is an independent implementation of the same recognition kernel — no DSH code, no runtime dependency (DSH can be closed). The only link is that the first run reuses the model files DSH already downloaded, saving the 240 MB download (otherwise `vtt models --fetch`). `from-dsh` in the repository name only records where the idea and the models came from.
+
 > 中文说明（更详细，含设计与排查）见 [README.md](README.md).
 
 ---
@@ -24,7 +26,7 @@ Recognition is **fully local**: SenseVoiceSmall (ONNX int8) + Silero VAD through
 ## Install
 
 ```powershell
-git clone <this repo> voice-to-text
+git clone https://github.com/TimeLord00/voice-to-text-from-dsh.git voice-to-text
 cd voice-to-text
 .\install.ps1
 ```
