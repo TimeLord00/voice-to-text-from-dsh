@@ -109,6 +109,68 @@ check('unknown path is 404', notFound.status === 404, `status ${notFound.status}
 const wrongMethod = await fetch(`${BASE}/health`, { method: 'POST', headers: auth })
 check('GET-only path rejects POST', wrongMethod.status === 405, `status ${wrongMethod.status}`)
 
+// The dictation state machine, driven without a window, a hotkey or a click. The field bug this section
+// locks down: a second click that stops a recording of a few hundred milliseconds took the discard branch
+// and, when that branch threw, left the machine on `transcribing` for the rest of the process's life —
+// the button stayed yellow with three dots and every later click only played the error cue.
+process.stdout.write('\ndictation state machine\n')
+const machineConfig = { ...config, minSeconds: 0.3, maxSeconds: 60, beeps: false }
+const transitions = []
+const machine = new Dictation(machineConfig, engine, { log: () => {}, beeps: false, onState: (state) => transitions.push(state) })
+
+await machine.begin()
+check('begin() starts a recording', machine.state === 'recording', machine.state)
+await new Promise((resolve) => setTimeout(resolve, 120))
+const discarded = await machine.finish()
+check('a recording shorter than minSeconds comes back discarded instead of throwing', discarded.discarded === true && discarded.text === '', JSON.stringify({ discarded: discarded.discarded, text: discarded.text }))
+check('the machine is idle again after a discard', machine.state === 'idle', machine.state)
+check('the transition log ends on idle and never stops at transcribing', transitions[transitions.length - 1] === 'idle' && transitions.includes('transcribing'), transitions.join(' -> '))
+
+const secondStart = await machine.begin()
+check('the machine records again right after a discard', secondStart.state === 'recording', JSON.stringify(secondStart))
+await new Promise((resolve) => setTimeout(resolve, 120))
+const discardedTwice = await machine.finish()
+check('the second short recording is discarded as well', discardedTwice.discarded === true, JSON.stringify({ discarded: discardedTwice.discarded }))
+check('two discards in a row leave no state behind', machine.state === 'idle', machine.state)
+
+const cancelled = new Dictation(machineConfig, engine, { log: () => {}, beeps: false })
+await cancelled.begin()
+check('an explicit cancel returns to idle', cancelled.discard().state === 'idle' && cancelled.state === 'idle', cancelled.state)
+
+// A device that fails must not wedge it either: the finally block in finish() is the safety net.
+const brokenStop = new Dictation(machineConfig, engine, { log: () => {}, beeps: false })
+await brokenStop.begin()
+await new Promise((resolve) => setTimeout(resolve, 400))
+brokenStop.microphone.save = () => {
+  throw new Error('the device disappeared')
+}
+let stopRejected = false
+try {
+  await brokenStop.finish()
+} catch {
+  stopRejected = true
+}
+check('a recorder that fails while stopping rejects finish()', stopRejected)
+check('a failed stop leaves the machine idle, not transcribing', brokenStop.state === 'idle', brokenStop.state)
+
+const brokenStart = new Dictation(machineConfig, engine, { log: () => {}, beeps: false })
+// The microphone is created lazily by begin(), so it is opened once and released before the device is
+// made to fail — that is the field shape: the device is there, but it refuses to stream.
+await brokenStart.begin()
+brokenStart.discard()
+brokenStart.microphone.start = () => {
+  throw new Error('the device is busy')
+}
+let startRejected = false
+try {
+  await brokenStart.begin()
+} catch {
+  startRejected = true
+}
+check('a recorder that refuses to start rejects begin()', startRejected)
+check('a failed start leaves the machine idle', brokenStart.state === 'idle', brokenStart.state)
+check('a recording can still be started after a failed attempt', brokenStart.microphone !== null && typeof brokenStart.microphone.start === 'function')
+
 server.close()
 process.stdout.write(failures.length ? `\n${failures.length} check(s) failed\n` : '\nall checks passed\n')
 process.exit(failures.length ? 1 : 0)

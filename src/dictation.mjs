@@ -43,6 +43,8 @@ export class Dictation {
     this.onState = options.onState ?? null
     /** Set once, so a device that always refuses the cue does not spam the log. @type {boolean} */
     this.cueProblemLogged = false
+    /** Whether a `finish()` call is in flight; a state of `transcribing` without this is a wedge. @type {boolean} */
+    this.finishing = false
   }
 
   /**
@@ -100,7 +102,15 @@ export class Dictation {
    */
   begin() {
     if (this.state === DictationState.Recording) return { state: this.state, seconds: this.elapsedSeconds }
-    if (this.state === DictationState.Transcribing) throw new Error('Still transcribing the previous recording')
+    if (this.state === DictationState.Transcribing) {
+      // Only a `finish()` that is actually running may refuse a new recording. A state left behind by a
+      // failed transcription refuses every later recording forever — the floating button then stays
+      // yellow with three dots and answers each click with an error cue — so a begin() that arrives with
+      // nothing in flight recovers instead of blocking.
+      if (this.finishing) throw new Error('Still transcribing the previous recording')
+      this.log('! the previous transcription did not finish cleanly; recovering')
+      this.setState(DictationState.Idle)
+    }
     this.engine.load()
     this.microphone ??= new Microphone()
     const startedAt = Date.now()
@@ -122,54 +132,79 @@ export class Dictation {
 
   /**
    * Stop recording, transcribe and deliver the text to the focused window.
+   *
+   * Every exit from this method leaves the machine idle. That is a hard rule, not tidiness: a state stuck
+   * on `transcribing` refuses every later recording with "Still transcribing the previous recording",
+   * and with the floating button it shows as an icon that stays yellow with three dots while every click
+   * only produces the error cue. A double click that produced a 0.3 s recording was enough to do exactly
+   * that in the field, because the too-short branch threw and the state was never reset.
    * @returns {Promise<{text: string, seconds: number, inferenceMs: number, pasted: boolean, clipboard: boolean, target: string, peakDbfs: number}>}
    *   the transcription result; `peakDbfs` is the capture level, which is what tells a quiet microphone
-   *   apart from a silent one when nothing was recognized.
+   *   apart from a silent one when nothing was recognized. A recording shorter than `minSeconds` comes
+   *   back with `text: ''` and `discarded: true` instead of throwing — it is a change of mind, not a
+   *   failure.
    */
   async finish() {
     if (this.state !== DictationState.Recording) throw new Error('Not recording')
     clearTimeout(this.autoStopTimer)
     this.autoStopTimer = null
+    this.finishing = true
     this.setState(DictationState.Transcribing)
     const seconds = this.elapsedSeconds
     const path = tempRecordingPath()
-    let canonical
-    let format
+    let format = null
     try {
-      if (seconds < this.config.minSeconds) {
-        this.microphone.discard()
-        this.cue('error')
-        throw new Error(`Recording was only ${seconds.toFixed(1)}s (shorter than ${this.config.minSeconds}s); ignored`)
+      let canonical
+      try {
+        if (seconds < this.config.minSeconds) {
+          this.microphone.discard()
+          this.cue('error')
+          this.log(`✕ discarded ${seconds.toFixed(1)}s (shorter than ${this.config.minSeconds}s); press again and speak a little longer`)
+          return {
+            text: '',
+            audioSeconds: seconds,
+            inferenceSeconds: 0,
+            segments: 0,
+            discarded: true,
+            pasted: false,
+            clipboard: false,
+            target: foregroundWindowTitle(),
+          }
+        }
+        const saved = this.microphone.save(path)
+        format = saved.format
+        canonical = toCanonicalWav(readFileSync(path), format)
+      } finally {
+        rmSync(path, { force: true })
+        this.microphone.close()
       }
-      const saved = this.microphone.save(path)
-      format = saved.format
-      const raw = readFileSync(path)
-      canonical = toCanonicalWav(raw, format)
+      const size = describeCanonical(canonical)
+      // A level report costs one pass over the samples and answers the most common field question —
+      // "why did it say nothing?" — the moment the result comes back, instead of leaving the user to
+      // wonder whether the microphone was even heard.
+      const peakDbfs = speechActivity(canonicalToFloat(canonical)).peakDbfs
+      if (this.config.keepRecordings) this.log(`  kept the recording at ${keepRecording(canonical)}`)
+      this.log(`… transcribing ${size.seconds.toFixed(1)}s of audio (peak ${peakDbfs.toFixed(1)} dBFS)`)
+      const result = this.engine.transcribe(canonical, this.config.language)
+      // The engine refuses to decode a recording that is nothing but its own noise floor. That refusal is
+      // correct but opaque — "nothing was recognized" for a user who just spoke is the complaint that
+      // started this — so the measurement behind the decision goes into the log, including the detector's
+      // second opinion when the model happened to be resident.
+      if (!result.text && result.reason === 'no-speech-activity') {
+        for (const line of explainNoSpeech(result, this.config)) this.log(`  ${line}`)
+      }
+      const delivery = await this.deliver(result.text)
+      this.setState(DictationState.Idle)
+      this.lastResult = { ...result, ...delivery, format, peakDbfs }
+      this.cue(result.text ? 'done' : 'error')
+      if (this.onText) this.onText(this.lastResult)
+      return this.lastResult
     } finally {
-      rmSync(path, { force: true })
-      this.microphone.close()
+      // Safety net for anything unforeseen above (a device error, a failed decode, a throwing paste):
+      // the caller logs the message, but the state must never be left half-way through a transition.
+      this.finishing = false
+      if (this.state !== DictationState.Idle) this.setState(DictationState.Idle)
     }
-    const size = describeCanonical(canonical)
-    // A level report costs one pass over the samples and answers the most common field question —
-    // "why did it say nothing?" — the moment the result comes back, instead of leaving the user to
-    // wonder whether the microphone was even heard.
-    const peakDbfs = speechActivity(canonicalToFloat(canonical)).peakDbfs
-    if (this.config.keepRecordings) this.log(`  kept the recording at ${keepRecording(canonical)}`)
-    this.log(`… transcribing ${size.seconds.toFixed(1)}s of audio (peak ${peakDbfs.toFixed(1)} dBFS)`)
-    const result = this.engine.transcribe(canonical, this.config.language)
-    // The engine refuses to decode a recording that is nothing but its own noise floor. That refusal is
-    // correct but opaque — "nothing was recognized" for a user who just spoke is the complaint that
-    // started this — so the measurement behind the decision goes into the log, including the detector's
-    // second opinion when the model happened to be resident.
-    if (!result.text && result.reason === 'no-speech-activity') {
-      for (const line of explainNoSpeech(result, this.config)) this.log(`  ${line}`)
-    }
-    const delivery = await this.deliver(result.text)
-    this.setState(DictationState.Idle)
-    this.lastResult = { ...result, ...delivery, format, peakDbfs }
-    this.cue(result.text ? 'done' : 'error')
-    if (this.onText) this.onText(this.lastResult)
-    return this.lastResult
   }
 
   /**

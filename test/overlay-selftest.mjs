@@ -148,6 +148,11 @@ const draggingTick = tick({ dragging: true, caret: { x: 500, y: 300, height: 18 
 check(draggingTick.action === 'none', 'a drag outranks the caret', draggingTick.reason)
 const pinnedTick = tick({ pinned: true, caret: { x: 700, y: 300, height: 18 } })
 check(pinnedTick.action === 'none', 'a pinned button is not dragged back to the caret', pinnedTick.reason)
+// A pending press must freeze the window too: if the follow timer moves the button between the press and
+// the release, the release looks like a drag of a window nobody dragged (field log: `button pinned` for
+// plain clicks).
+const pressedTick = tick({ pressed: true, caret: { x: 500, y: 300, height: 18 } })
+check(pressedTick.action === 'none' && pressedTick.reason === 'pressed', 'a pending press freezes the follow', `${pressedTick.action}/${pressedTick.reason}`)
 const optedIn = tick({ seenCaret: true, pointer: { x: 200, y: 200 }, overlay: { hideWithoutCaret: true } })
 check(optedIn.action === 'hide', 'hideWithoutCaret asks for the old hiding behaviour', optedIn.reason)
 const gracedTick = tick({ seenCaret: true, pointer: { x: 200, y: 200 }, overlay: { hideWithoutCaret: true }, lastCaretAt: 9900 })
@@ -291,7 +296,48 @@ check(events[events.length - 1] === 'toggle', 'a wobble under the drag threshold
 check(button.window.position.x === before.x && button.window.position.y === before.y, 'a wobble does not move the button', `${before.x},${before.y} -> ${button.window.position.x},${button.window.position.y}`)
 
 {
+  // The other half of the same field bug: the release sample used to be compared with the press sample,
+  // so a hand that drifted a few pixels during an ordinary click was read as a drag and the button got
+  // parked instead of starting a recording (the log showed `button pinned at ...` for plain clicks).
+  // Movement counts only while the press is held, which the 16 ms poll watches; a press and release that
+  // happen without any tick in between can never be a drag, however far the sample moved.
+  const togglesBefore = events.filter((event) => event === 'toggle').length
+  const parked = { ...button.window.position }
+  button.beginDrag()
+  pointer.x += 40
+  pointer.y += 25
+  button.endDrag()
+  await waitFor(() => events.length >= togglesBefore + 1, 500)
+  check(events.filter((event) => event === 'toggle').length === togglesBefore + 1, 'a hand that drifts during a click still toggles', events.join(','))
+  check(button.pinned === false, 'a drifting click does not park the button')
+  check(button.window.position.x === parked.x && button.window.position.y === parked.y, 'a drifting click leaves the button where it was', `${parked.x},${parked.y} -> ${button.window.position.x},${button.window.position.y}`)
+}
+
+{
+  // The follow tick must not move the window while a press is pending: if it does, the release looks like
+  // a drag of a window nobody dragged, because the window travelled without the user dragging it.
+  const parked = { ...button.window.position }
+  button.pinned = false
+  button.beginDrag()
+  const plan = planFollow({
+    caret: { x: parked.x + 900, y: parked.y + 400, height: 18 },
+    pointer: { x: 0, y: 0 },
+    window: { x: parked.x, y: parked.y, width: button.window.width, height: button.window.height },
+    size: 46,
+    overlay: button.overlay,
+    pressed: button.dragStart !== null,
+    visible: true,
+    screen,
+  })
+  check(plan.action === 'none' && plan.reason === 'pressed', 'the running button reports a pending press to the follow rules', `${plan.action}/${plan.reason}`)
+  button.cancelPress('test')
+  check(button.dragStart === null && button.dragging === false && button.dragTimer === null, 'dropping a press clears the drag bookkeeping')
+  check(button.window.position.x === parked.x && button.window.position.y === parked.y, 'dropping a press leaves the button where it was')
+}
+
+{
   const start = { ...button.window.position }
+  const togglesBeforeDrag = events.filter((event) => event === 'toggle').length
   pressAt(start.x + 100, start.y + 100)
   moveTo(pointer.x + 50, pointer.y + 20)
   moveTo(pointer.x + 150, pointer.y + 80)
@@ -299,7 +345,7 @@ check(button.window.position.x === before.x && button.window.position.y === befo
   check(button.window.position.x === start.x + 200 && button.window.position.y === start.y + 100, 'the button follows the pointer while dragged', `${start.x},${start.y} -> ${button.window.position.x},${button.window.position.y}`)
   release()
   const toggles = events.filter((event) => event === 'toggle').length
-  check(toggles === 2, 'releasing a drag does not toggle dictation', `${toggles} toggles`)
+  check(toggles === togglesBeforeDrag, 'releasing a drag does not toggle dictation', `${toggles - togglesBeforeDrag} extra toggles`)
   check(button.pinned, 'the button stays where it was dropped')
 
   // The field bug: the window moves under the pointer, so the client coordinates of every following
@@ -450,6 +496,29 @@ if (live) {
   const reported = await waitFor(() => /✔|no speech recognized/.test(readLog()), 30000)
   check(reported, 'the session reports a result', reported ? '' : readLog().slice(-300))
   check(exited === null, 'the overlay stays resident after a transcription')
+
+  // The field bug behind "two fast clicks turn it yellow with three dots and it never comes back": the
+  // second click stops a recording of a few hundred milliseconds, which is discarded — and that branch
+  // used to throw, leaving the state machine on `transcribing` for the rest of the process's life. Every
+  // later click then produced nothing but the error cue. This is the regression test for it.
+  let mark = readLog().length
+  const since = () => readLog().slice(mark)
+  click()
+  const startedFast = await waitFor(() => /recording \(max/.test(since()), 4000)
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 120))
+  click()
+  const threwAway = await waitFor(() => /discarded [\d.]+s \(shorter than/.test(since()), 8000)
+  check(startedFast && threwAway, 'two fast clicks discard the too-short recording', since().slice(-200))
+  mark = readLog().length
+  click()
+  const usableAgain = await waitFor(() => /recording \(max/.test(since()), 4000)
+  check(usableAgain, 'the button records again after a discarded recording', since().slice(-200))
+  check(!/Still transcribing/.test(readLog()), 'no click was refused as "still transcribing"')
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 1000))
+  mark = readLog().length
+  click()
+  await waitFor(() => /✔|no speech recognized|discarded /.test(since()), 25000)
+  check(exited === null, 'the overlay is still resident after the discarded recording')
 
   // Hiding is what a middle-click does, and it must be real in the window rather than a flag in the
   // child's memory — the user's way back is the tray menu, which reads exactly this visibility.

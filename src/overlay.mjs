@@ -41,6 +41,9 @@ const POINTER_FREEZE = 8
 /** Milliseconds the button stays put after the caret is lost before it steps aside. */
 const CARET_GRACE_MS = 1200
 
+/** Milliseconds after which an unreleased press is dropped (a lost release must not freeze the button). */
+const PRESS_TIMEOUT_MS = 2500
+
 /**
  * Whether the pointer is close enough to the button that it must not be moved automatically.
  * @param {{x: number, y: number, width: number, height: number}} rect - the window rectangle.
@@ -83,8 +86,9 @@ export function shouldStepAside(context) {
  * button can always be clicked, which is the whole point of it existing.
  * @param {{caret?: object|null, pointer?: {x: number, y: number}|null, window?: object, size: number,
  *   gap?: number, margin?: number, overlay?: object, state?: string, seenCaret?: boolean,
- *   lastCaretAt?: number, now?: number, pinned?: boolean, dragging?: boolean, visible?: boolean,
- *   screen?: object}} context - caret, pointer, window rectangle, configuration and bookkeeping.
+ *   lastCaretAt?: number, now?: number, pinned?: boolean, dragging?: boolean, pressed?: boolean,
+ *   visible?: boolean, screen?: object}} context - caret, pointer, window rectangle, configuration and
+ *   bookkeeping.
  * @returns {{action: 'none'|'move'|'hide', reason: string, sawCaret: boolean, x?: number, y?: number}}
  *   what to do and where to put the window.
  */
@@ -92,6 +96,9 @@ export function planFollow(context) {
   const { caret, pointer, window, size, gap = 6, margin = 0, overlay = {}, state = 'idle', now = Date.now() } = context
   const sawCaret = Boolean(caret)
   if (context.dragging) return { action: 'none', reason: 'dragging', sawCaret }
+  // A press is pending: the window must not move until it is released, or the release looks like a drag
+  // of a window nobody dragged (the field log showed `button pinned at ...` for plain clicks).
+  if (context.pressed) return { action: 'none', reason: 'pressed', sawCaret }
   if (context.pinned) return { action: 'none', reason: 'pinned', sawCaret }
   if (context.visible !== false && window && pointer
     && pointerInside(window, pointer, overlay.pointerFreezePx ?? POINTER_FREEZE)) {
@@ -144,6 +151,7 @@ export class MicButton {
     this.dragTimer = null
     this.dragOrigin = null
     this.dragStart = null
+    this.pressAt = 0
     this.margin = 0
     this.scale = 1
     this.visualSize = this.overlay.size ?? 46
@@ -216,6 +224,12 @@ export class MicButton {
    */
   follow() {
     if (!this.window) return
+    if (this.dragStart && Date.now() - this.pressAt > PRESS_TIMEOUT_MS) {
+      // The release never arrived (the button lost capture to a UAC prompt, a menu or another window).
+      // A press cannot last this long, and a press that is never released would freeze the follow and
+      // turn every later hover-move into a drag, so it is dropped here.
+      this.cancelPress('the release never arrived')
+    }
     const foreground = foregroundWindow()
     if (foreground !== this.lastForeground) {
       this.lastForeground = foreground
@@ -241,6 +255,7 @@ export class MicButton {
       now,
       pinned: this.pinned,
       dragging: this.dragging,
+      pressed: this.dragStart !== null,
       visible: this.window.visible,
     })
     if (plan.sawCaret) {
@@ -455,6 +470,7 @@ export class MicButton {
    */
   beginDrag() {
     this.dragging = false
+    this.pressAt = Date.now()
     this.dragOrigin = { x: this.window.position.x, y: this.window.position.y }
     this.dragStart = this.pointerAt()
     if (!this.dragTimer) {
@@ -463,11 +479,31 @@ export class MicButton {
   }
 
   /**
+   * Drop a press that will never be released.
+   * @param {string} reason - why the press is being abandoned (for the log).
+   * @returns {void}
+   */
+  cancelPress(reason) {
+    if (this.dragTimer) {
+      clearInterval(this.dragTimer)
+      this.dragTimer = null
+    }
+    this.dragStart = null
+    this.dragOrigin = null
+    this.dragging = false
+    this.pressAt = 0
+    this.log(`! a press on the button was never released (${reason}); it was dropped`)
+  }
+
+  /**
    * Finish a press: pin the button when it was dragged, otherwise treat it as a click.
    *
-   * The decision is made from the pointer, not from the move messages alone: a press whose moves never
-   * arrived (or were swallowed) would otherwise be classified as a click, which is exactly how dragging
-   * the button started a recording in the field.
+   * The decision is the movement that happened *while the press was held*, never the distance between
+   * the press and the release sample: a hand moves a few pixels during an ordinary click, and reading
+   * that as a drag made clicks park the button instead of starting a recording (the field log shows
+   * `button pinned at ...` for clicks). The 16 ms poll watches the pointer for the whole press, so a
+   * swallowed move message cannot hide a real drag either — which is what the release-sample check was
+   * originally added for.
    * @returns {void}
    */
   endDrag() {
@@ -475,15 +511,13 @@ export class MicButton {
       clearInterval(this.dragTimer)
       this.dragTimer = null
     }
-    const press = this.dragStart
     const threshold = this.overlay.dragThresholdPx ?? DRAG_THRESHOLD
+    const origin = this.dragOrigin
     this.dragStart = null
-    if (!this.dragging && press) {
-      const now = this.pointerAt()
-      if (now && Math.hypot(now.x - press.x, now.y - press.y) >= threshold) this.dragging = true
-    }
-    const travelled = this.dragOrigin && this.window
-      ? Math.hypot(this.window.position.x - this.dragOrigin.x, this.window.position.y - this.dragOrigin.y)
+    this.dragOrigin = null
+    this.pressAt = 0
+    const travelled = origin && this.window
+      ? Math.hypot(this.window.position.x - origin.x, this.window.position.y - origin.y)
       : 0
     if (this.dragging || travelled >= threshold) {
       this.dragging = false

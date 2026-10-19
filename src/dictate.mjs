@@ -187,6 +187,13 @@ function sleep(ms) {
  * @returns {void}
  */
 function report(log, result) {
+  // A recording that was too short to be worth transcribing already logged its own line inside
+  // Dictation.finish (and played the failure cue); reporting it as an empty result would suggest the
+  // recognizer ran and found nothing.
+  if (result.discarded) {
+    log('')
+    return
+  }
   const seconds = result.audioSeconds.toFixed(1)
   const inference = (result.inferenceSeconds * 1000).toFixed(0)
   const where = result.pasted ? `pasted into ${result.target || 'the focused window'}` : result.clipboard ? 'copied to the clipboard' : 'not delivered'
