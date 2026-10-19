@@ -103,7 +103,7 @@ Common flags: `--language zh|en|yue|ja|ko|auto`, `--no-paste` (clipboard only), 
   "pasteDelayMs": 120,
   "beeps": true,
   "beepVolume": 0.7,
-  "speechMarginDb": 10,
+  "speechMarginDb": 16,
   "minSpeechFrames": 4,
   "keepRecordings": false,
   "overlay": {
@@ -127,14 +127,18 @@ Common flags: `--language zh|en|yue|ja|ko|auto`, `--no-paste` (clipboard only), 
 
 ## Silence safety (why it does not type nonsense)
 
-SenseVoice happily invents fluent sentences out of room tone — measured here: 3 seconds of an empty room decoded to a full Chinese sentence. Before every transcription the tool measures 20 ms frame levels and refuses to call the model unless `minSpeechFrames` consecutive frames (4 = 80 ms) rise `speechMarginDb` (10 dB) above that recording's own noise floor, returning `reason: "no-speech-activity"` with the measured `level ... dBFS` and the run it found. A relaxed second rule (240 ms at 6 dB) catches very quiet speech. The test is relative, so quiet-but-real speech is not thrown away — the previous 16 dB default did throw away a voice 20 dB below normal speech, which is one way the tool could look like it did nothing at all:
+SenseVoice happily invents fluent sentences out of room tone — measured here: 3 seconds of an empty room decoded to a full Chinese sentence. Before every transcription the tool measures 20 ms frame levels and refuses to call the model unless `minSpeechFrames` consecutive frames (4 = 80 ms) rise `speechMarginDb` (16 dB) above that recording's own noise floor, returning `reason: "no-speech-activity"` with the measured `level ... dBFS` and the run it found. A relaxed second rule (480 ms at 10 dB) catches a soft but sustained sentence. The test is relative to the recording, so quiet-but-real speech survives; the defaults come from measurements taken on this machine with `probe/gate-sweep.mjs` (`--synth` and `--cue`), and the noise floor is not a constant:
 
-| recording | peak | longest run at +6 dB | longest run at +10 dB |
+| recording | peak | longest run at +10 dB | longest run at +16 dB |
 | --- | --- | --- | --- |
-| empty room | -29 … -30 dBFS | 120-140 ms | 20 ms (1 frame) |
-| room + one click sample | -26.9 dBFS | 140 ms | 20 ms |
-| very quiet voice (20 dB below normal) | -27.8 dBFS | 260 ms | 100 ms (5 frames) |
-| normal voice | -22.7 dBFS | 340 ms | 160 ms |
+| empty room, quiet hour | -29 … -31 dBFS | 0-20 ms | 0 ms |
+| empty room, loud hour | -22.7 dBFS | **240 ms** | 20 ms (1 frame) |
+| room tone with the start cue bleeding in | -27.6 dBFS | 80 ms | 0 ms |
+| room + one click sample | -26.9 dBFS | 20 ms | 0 ms |
+| very quiet voice (20 dB below normal) | -27.8 dBFS | 100 ms | 0 ms |
+| normal voice | -22.7 dBFS | 160 ms | 120 ms (6 frames) |
+
+Row two is why the strict margin is 16 dB and not the 10 dB this started with: at 10 dB the loud-hour room tone produced a 240 ms run, was decoded, and the model answered the empty room with an invented sentence that the floating button pasted into the focused window. The trade-off is explicit: a short *and* soft utterance can now be refused, the log prints exactly what was measured, and `speechMarginDb` (12 in a quiet room, 0 to disable) is the knob. Note that the model's own tags cannot help here — it labels room tone `<|Speech|>` (`node probe/sensevoice-fields.mjs <file.wav>`).
 
 `--speech-margin-db 0` disables the gate. Every result prints the level and, when the gate refuses, what it measured and which of the two conclusions applies (no sound at all vs. speech that was simply too quiet).
 
@@ -154,8 +158,8 @@ Two honest caveats: `Shell_NotifyIcon` is refused with `error 5` inside low-inte
 
 | symptom | what to do |
 | --- | --- |
-| Recording works but the text is empty | The result now prints the measurement and the gate''s verdict: `longest run above +10 dB: N frame(s), 4 needed` plus either `nothing in it stands out from its own noise floor` (the microphone is not hearing you — check mute, Windows privacy settings, the default input device, raise the input level) or `the voice detector still found N s of speech` (you spoke, just too quietly for the gate: retry with `--speech-margin-db 8`). |
-| A word or two sometimes produces nothing at all | That is what the gate does when the speech is too quiet: it refuses to decode rather than let the model invent a sentence out of room tone. The old default (16 dB above the floor) threw away a voice 20 dB below normal speech; the current one (10 dB, 4-frame run, plus a 6 dB/240 ms relaxed rule) is measured against real recordings. Every refusal is now explained in the log, and `--keep-recordings` keeps the audio so `node probe/gate-sweep.mjs <file>` can show which margin it would pass. |
+| Recording works but the text is empty | The result prints the measurement and the gate's verdict: `longest run above +16 dB: N frame(s), 4 needed` plus either `nothing in it stands out from its own noise floor` (the microphone is not hearing you — check mute, Windows privacy settings, the default input device, raise the input level) or `the voice detector still found N s of speech` (you spoke, just too quietly for the gate: retry with `--speech-margin-db 12`). |
+| A word or two sometimes produces nothing at all | That is what the gate does when a short utterance is too quiet: it refuses to decode rather than let the model invent a sentence out of room tone. The default requires an 80 ms run 16 dB above the recording's own noise floor, or 480 ms at 10 dB for a soft but continuous sentence. Every refusal is explained in the log, and `--keep-recordings` keeps the audio so `node probe/gate-sweep.mjs <file>` can show which margin it would pass. |
 | The first words are missing | The banner prints `microphone ready in Nms` (a warm-up capture at start-up). Wait for the icon to turn red before talking. |
 | `Cannot register the global hotkey ...` | Another application owns it (a voice-input plugin often does). Pass `--hotkey ctrl+alt+d`. `vtt overlay` only warns and keeps working. |
 | The button is gone | It does not hide by itself; check `overlay.log` and Task Manager for a leftover `node.exe`. A second launch revives a running button. |

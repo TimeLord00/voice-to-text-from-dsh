@@ -1,30 +1,35 @@
 /**
- * Why a cue before a recording can stall the recorder.
+ * Why a cue before a recording can stall the recorder — and whether the cue ends up in the capture.
  *
  * Symptom being chased: `vtt listen --seconds 2` (beeps on) printed its "recording" line and then never
  * finished; the same command with `--no-beeps` completed in seconds. This probe replays the sequence with
- * one playback technique per mode, times every native step, and prints where each mode stops.
+ * one playback technique per mode, times every native step, and prints where each mode stops. It also
+ * analyses every capture through the shipped speech gate, because a cue that the microphone can hear is a
+ * loud 100-250 ms tone: exactly the shape the gate looks for, so a silent clip could pass the gate and the
+ * model would answer a beep with an invented sentence.
  *
  *   none          record only (baseline)
- *   cue-before    PlaySound(SND_MEMORY | SND_ASYNC) before the recorder starts — what the tool does now
- *   cue-after     the recorder starts first, the cue follows
+ *   cue-before    PlaySound(SND_MEMORY | SND_ASYNC) before the recorder starts
+ *   cue-after     the recorder starts first, the cue follows — what the tool does now
  *   cue-file      PlaySound(SND_FILENAME | SND_ASYNC) from a temporary wav
  *   cue-sync      PlaySound from a file without SND_ASYNC (returns when the sound is over)
  *   message-beep  MessageBeep instead of PlaySound
  *   mci-cue       the cue played through MCI, the same API the recorder uses
- *   cue-sync-mem  PlaySound(SND_MEMORY) without SND_ASYNC before the recorder starts (proposed fix)
+ *   cue-sync-mem  PlaySound(SND_MEMORY) without SND_ASYNC before the recorder starts
  *   cue-sync-open the same blocking playback while the recorder is already running
  *
  * A 30 s watchdog prints the step that never returned and exits 9, so a stall cannot hang the caller.
  *
  * Usage: node probe\cue-capture-probe.mjs [mode|all]
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import koffi from 'koffi'
 import { Microphone, mci, playCue } from '../src/win32.mjs'
 import { renderCue } from '../src/sound.mjs'
+import { decodeWav, speechActivity } from '../src/wav.mjs'
+import { loadConfig } from '../src/config.mjs'
 
 const MODES = ['none', 'cue-before', 'cue-after', 'cue-file', 'cue-sync', 'message-beep', 'mci-cue', 'cue-sync-mem', 'cue-sync-open']
 const SND_ASYNC = 0x0001
@@ -38,6 +43,7 @@ const PlaySoundW = winmm.func('int PlaySoundW(void *sound, void *module, unsigne
 const MessageBeep = user32.func('int MessageBeep(unsigned int type)')
 
 const mode = process.argv[2] ?? 'all'
+const config = loadConfig({})
 let step = 'start'
 let watchdog = null
 
@@ -91,6 +97,18 @@ async function run(which) {
       const saved = microphone.save(output)
       return `${saved.seconds.toFixed(2)}s ${saved.format.sampleRate}Hz`
     })
+    // Does the cue itself end up in the capture? A cue is a loud 100-250 ms tone, which is exactly the
+    // shape the speech gate looks for: if the microphone hears it, a silent recording can pass the gate
+    // and the model will answer a beep with an invented sentence.
+    const recording = decodeWav(readFileSync(output), { sampleRate: 48000, channels: 2, bitsPerSample: 16 })
+    const activity = speechActivity(recording.samples, { sampleRate: recording.sampleRate })
+    const margin = config.speechMarginDb
+    log(
+      `    capture: peak ${activity.peakDbfs.toFixed(1)} dBFS, floor ${activity.floorDbfs.toFixed(1)} dBFS, ` +
+        `longest run +${margin} dB: ${activity.longestRunFrames} frame(s) (${activity.longestRunMs} ms), ` +
+        `relaxed: ${activity.relaxedRunFrames} (${activity.relaxedRunMs} ms) ` +
+        `-> gate says ${activity.hasSpeech ? 'SPEECH (would decode)' : 'no speech (would refuse)'}`
+    )
   } catch (error) {
     outcome = `error: ${error?.message ?? error}`
   } finally {

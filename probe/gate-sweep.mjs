@@ -9,13 +9,14 @@
  * Usage:
  *   node probe/gate-sweep.mjs <file.wav> [more.wav ...]
  *   node probe/gate-sweep.mjs --synth            # room tone + a synthetic quiet voice at the same peak
+ *   node probe/gate-sweep.mjs --cue              # room tone while the start cue plays
  *
  * Every real file goes through the real pipeline (toCanonicalWav -> canonicalToFloat), so what is
  * measured is exactly what the recognizer would have received.
  */
 import { readFileSync, rmSync } from 'node:fs'
 import { basename } from 'node:path'
-import { Microphone, tempRecordingPath, MIC_FORMAT } from '../src/win32.mjs'
+import { Microphone, tempRecordingPath, playCue, MIC_FORMAT } from '../src/win32.mjs'
 import { toCanonicalWav, canonicalToFloat, TARGET_RATE, speechActivity } from '../src/wav.mjs'
 import { loadConfig } from '../src/config.mjs'
 
@@ -96,12 +97,13 @@ function synthesize() {
   rmSync(saved.path, { force: true })
   report('captured room tone (this machine, right now)', room)
 
-  // A voice at the level the user's failing attempts reached: syllable bursts whose 20 ms frames sit
-  // roughly 10 dB above the room floor, with a peak around -27 dBFS.
+  // A voice at the level the user's failing attempts reached: voiced syllable bursts whose 20 ms frames
+  // sit roughly 10 dB above the room floor, with gaps of the length real speech leaves between syllables
+  // (a 150 ms gap would break every run and make the measurement look worse than a real voice).
   for (const scale of [0.02, 0.045, 0.09]) {
     const voiced = Float32Array.from(room)
     const syllable = Math.round(TARGET_RATE * 0.25)
-    const gap = Math.round(TARGET_RATE * 0.15)
+    const gap = Math.round(TARGET_RATE * 0.05)
     let position = Math.round(TARGET_RATE * 0.3)
     let syllableIndex = 0
     while (position + syllable < voiced.length) {
@@ -125,8 +127,28 @@ function synthesize() {
   report('room tone + a single sample click (peak -27 dBFS, no speech structure)', clicked)
 }
 
+/** Room tone captured while the start cue plays — what an empty room sounds like to the gate. */
+function withCue() {
+  for (const order of ['during', 'before']) {
+    const microphone = new Microphone()
+    microphone.open()
+    // The shipped order plays the cue right after the recorder starts; the alternative plays it first.
+    if (order === 'before') playCue('start', config.beepVolume)
+    microphone.start()
+    if (order === 'during') playCue('start', config.beepVolume)
+    const until = Date.now() + 2500
+    while (Date.now() < until) { /* the recorder runs on its own thread */ }
+    const saved = microphone.save(tempRecordingPath())
+    microphone.close()
+    const room = canonicalToFloat(toCanonicalWav(readFileSync(saved.path), saved.format))
+    rmSync(saved.path, { force: true })
+    report(`room tone with the start cue played ${order} the recording (volume ${config.beepVolume})`, room)
+  }
+}
+
 const args = process.argv.slice(2)
 if (args.length === 0 || args[0] === '--synth') synthesize()
+else if (args[0] === '--cue') withCue()
 else {
   for (const file of args) {
     report(`${basename(file)}`, canonicalToFloat(toCanonicalWav(readFileSync(file))))

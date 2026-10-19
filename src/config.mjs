@@ -71,15 +71,18 @@ export const DEFAULTS = {
    *
    * The recognizer answers steady room tone with an invented sentence, and the floating button pastes
    * whatever comes back, so a recording with nothing above this margin is reported as empty instead of
-   * decoded. The default is a compromise measured on this machine (see probe/gate-sweep.mjs): room tone
-   * peaks 140 ms above its own floor at +6 dB and 20 ms at +10 dB, while a quiet voice 20 dB below normal
-   * speech still holds 100 ms at +10 dB. The older 16 dB threw that quiet voice away. 0 disables the test
-   * and always decodes.
+   * decoded. The default is measured on this machine (probe/gate-sweep.mjs): the noise floor drifts by 8 dB
+   * between hours, and at its loud end room tone holds a 240 ms run at +10 dB while normal speech holds
+   * 120 ms at +16 dB. 10 dB therefore decoded the empty room — "花要来长的时候可以用。" pasted into whatever
+   * was focused — so the strict margin is 16 dB again, with the relaxed rule below as the quiet-speech path.
+   * Lower this to 12 (or 0 to disable the test entirely) in a quiet room, or when a soft voice is refused.
    */
-  speechMarginDb: 10,
+  speechMarginDb: 16,
   /**
    * Consecutive frames that must clear {@link speechMarginDb} before a recording is worth decoding
    * (4 frames = 80 ms). A run rather than a total, because stationary noise always has a few loud frames.
+   * The relaxed rule is 6 dB less margin over 6x this run (10 dB over 480 ms), which catches a soft but
+   * sustained sentence while still refusing the loudest room tone measured here.
    */
   minSpeechFrames: 4,
   /** Global hotkey that starts and stops dictation. */

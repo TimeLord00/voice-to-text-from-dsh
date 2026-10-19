@@ -98,27 +98,36 @@ check('stationary noise is refused', quiet.hasSpeech === false, JSON.stringify({
 check('measured floor matches the injected level', Math.abs(quiet.floorDbfs - floor) < 4, `${quiet.floorDbfs.toFixed(1)} dBFS`)
 check('a single loud sample is not speech', speechActivity(withClick(noise(2000, 0.003))).hasSpeech === false)
 
-const word = speechActivity(noiseWithBurst(2000, 0.003, 220, 12))
-check('a 220 ms word 12 dB above the floor is decoded', word.hasSpeech === true, JSON.stringify({ run: word.longestRunFrames, runMs: word.longestRunMs }))
+const word = speechActivity(noiseWithBurst(2000, 0.003, 220, 20))
+check('a 220 ms word 20 dB above the floor is decoded', word.hasSpeech === true, JSON.stringify({ run: word.longestRunFrames, runMs: word.longestRunMs }))
 check('the word appears as one run of at least 4 frames', word.longestRunFrames >= 4, `${word.longestRunFrames} frames`)
 
-const blip = speechActivity(noiseWithBurst(2000, 0.003, 60, 14))
+const blip = speechActivity(noiseWithBurst(2000, 0.003, 60, 20))
 check('a 60 ms blip is too short to count', blip.hasSpeech === false, `${blip.longestRunFrames} frames`)
 
-// 9 dB: between the relaxed and the strict margin, the band where a quiet speaker lands.
-const murmur = speechActivity(noiseWithBurst(2000, 0.003, 300, 9))
-check('a 300 ms murmur 9 dB above the floor is still decoded', murmur.hasSpeech === true, JSON.stringify({ run: murmur.relaxedRunFrames, runMs: murmur.relaxedRunMs }))
-check('the murmur qualifies through the relaxed rule, not the strict one', murmur.longestRunFrames < 4 && murmur.relaxedRunFrames >= 12, `${murmur.longestRunFrames} / ${murmur.relaxedRunFrames}`)
+// The loudest room tone measured on this machine: a 240 ms run of frames 10 dB above its own floor. It was
+// decoded by the previous 10 dB default and the model answered it with an invented sentence, so it is a
+// regression case, not a hypothetical one.
+const loudRoom = speechActivity(noiseWithBurst(2000, 0.003, 240, 10))
+check('room tone with a 240 ms run at +10 dB is refused', loudRoom.hasSpeech === false, `${loudRoom.longestRunFrames} / ${loudRoom.relaxedRunFrames} frames`)
+check('room tone just under the strict margin is refused', speechActivity(noiseWithBurst(2000, 0.003, 40, 14)).hasSpeech === false)
+
+// 12 dB, sustained: the band where a soft but continuous voice lands. The strict margin cannot see it, so it
+// has to qualify through the relaxed rule (6 dB less margin over six times the run).
+const murmur = speechActivity(noiseWithBurst(2000, 0.003, 800, 12))
+check('an 800 ms murmur 12 dB above the floor is still decoded', murmur.hasSpeech === true, JSON.stringify({ run: murmur.relaxedRunFrames, runMs: murmur.relaxedRunMs }))
+check('the murmur qualifies through the relaxed rule, not the strict one', murmur.longestRunFrames < 4 && murmur.relaxedRunFrames >= 24, `${murmur.longestRunFrames} / ${murmur.relaxedRunFrames}`)
+check('a short murmur is not enough for the relaxed rule', speechActivity(noiseWithBurst(2000, 0.003, 240, 12)).hasSpeech === false)
 check('speech 4 dB above the floor is below both rules', speechActivity(noiseWithBurst(2000, 0.003, 300, 4)).hasSpeech === false)
 
 check('marginDb 0 decodes everything', speechActivity(noise(1000, 0.003), { marginDb: 0 }).hasSpeech === true)
 check('an empty recording is not speech', speechActivity(new Float32Array(0)).hasSpeech === false)
-check('a louder margin refuses what the default accepts', speechActivity(noiseWithBurst(2000, 0.003, 220, 4), { marginDb: 20 }).hasSpeech === false)
+check('a louder margin refuses what the default accepts', speechActivity(noiseWithBurst(2000, 0.003, 220, 20), { marginDb: 24 }).hasSpeech === false)
 check('the result exposes the documented measurements', ['peakDbfs', 'floorDbfs', 'medianDbfs', 'p90Dbfs', 'frames', 'activeFrames', 'longestRunFrames', 'longestRunMs', 'relaxedRunFrames', 'relaxedRunMs', 'hasSpeech']
   .every((key) => key in quiet))
 
 const defaults = loadConfig({})
-check('the shipped defaults are the tuned ones', defaults.speechMarginDb === 10 && defaults.minSpeechFrames === 4, `${defaults.speechMarginDb} dB / ${defaults.minSpeechFrames} frames`)
+check('the shipped defaults are the tuned ones', defaults.speechMarginDb === 16 && defaults.minSpeechFrames === 4, `${defaults.speechMarginDb} dB / ${defaults.minSpeechFrames} frames`)
 check('the shipped cue volume is in range', defaults.beepVolume > 0 && defaults.beepVolume <= 1, String(defaults.beepVolume))
 
 process.stdout.write('\ndictation cues\n')

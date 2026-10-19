@@ -208,27 +208,35 @@ export function describeCanonical(bytes) {
  *
  * The signal is framed, the frames are ranked, and speech is declared when a *run* of consecutive frames
  * stays above the tenth-percentile frame level. A run, not a count, because stationary noise always has a
- * few frames above any threshold (measured here: room tone has 14 frames above +8 dB but they never
- * last longer than 80 ms), while a spoken syllable is a plateau.
+ * few frames above any threshold, while a spoken syllable is a plateau.
  *
- * Two rules are applied. The first is the strict one; the second accepts speech that is very quiet but
- * long enough to be unmistakable. Measured on this machine (16 kHz mono, 20 ms frames, floor -49 dBFS):
+ * The noise floor of a machine is not a constant, so the margin has to be chosen for its loud end. On this
+ * machine (16 kHz mono, 20 ms frames, floor ≈ -49 dBFS) the same empty room measured:
  *
- *   recording                       peak      +6 dB     +10 dB    +12 dB    +16 dB
- *   room tone                       -29.4   140 ms     20 ms      0 ms      0 ms
- *   room tone + one click sample    -26.9   140 ms     20 ms      0 ms      0 ms
- *   quiet voice (peak -27.8)        -27.8   260 ms    100 ms     80 ms      0 ms
- *   normal voice (peak -22.7)       -22.7   340 ms    160 ms    140 ms    120 ms
+ *   recording                                peak      +10 dB    +12 dB    +16 dB
+ *   room tone, quiet hour                   -29.4      20 ms      0 ms      0 ms
+ *   room tone, loud hour                    -22.7     240 ms    240 ms     20 ms
+ *   room tone while the start cue plays     -27.6      80 ms     60 ms      0 ms
+ *   room tone + one click sample            -26.9      20 ms      0 ms      0 ms
+ *   synthetic quiet voice                   -27.8     100 ms     80 ms      0 ms
+ *   synthetic normal voice                  -22.7     160 ms    140 ms    120 ms
  *
- * The room tone row is why the defaults are 10 dB / 4 frames: the strict rule rejects noise with a
- * four-fold margin and still accepts a voice 20 dB quieter than normal speech, which the previous
- * 16 dB / 5 frames version silently threw away. The relaxed rule (60% of the margin, three times the run:
- * 6 dB over 240 ms) catches speech quieter still, and the same room tone reaches only 7 frames there.
+ * The loud-hour row is why the defaults are 16 dB / 4 frames (80 ms) and not the 10 dB / 4 frames this
+ * function started with: at 10 dB the loud room tone produced a 240 ms run and was decoded, and the model
+ * answered the empty room with "花要来长的时候可以用。" (`vtt overlay`, 2026-10-19 05:56Z, peak -27.4 dBFS).
+ * At 16 dB the same room tone keeps at most one or two frames, so a four-frame run is still a four-fold
+ * margin. Note that the model's own tags cannot help here: it labels room tone `<|Speech|>`
+ * (probe/sensevoice-fields.mjs).
+ *
+ * The relaxed rule accepts speech that is quiet but long enough to be unmistakable: 6 dB less margin, six
+ * times the run (10 dB over 480 ms by default). A full sentence spoken softly passes it; a short word
+ * spoken softly does not, and the log line from explainNoSpeech says so and names `speechMarginDb` as the
+ * knob to lower.
  * @param {Float32Array} samples - mono signal in [-1, 1] at any sample rate.
  * @param {{sampleRate?: number, frameMs?: number, marginDb?: number, minFrames?: number,
  *   relaxedMarginDb?: number, relaxedMinFrames?: number}} [options] framing and thresholds; `marginDb` 0
- *   disables the test (everything counts as speech). The relaxed rule defaults to 60% of the margin and
- *   three times the run.
+ *   disables the test (everything counts as speech). The relaxed rule defaults to 6 dB less margin over six
+ *   times the run.
  * @returns {{peakDbfs: number, floorDbfs: number, medianDbfs: number, p90Dbfs: number, frames: number,
  *   activeFrames: number, longestRunFrames: number, longestRunMs: number, relaxedRunFrames: number,
  *   relaxedRunMs: number, hasSpeech: boolean}} the measurement.
@@ -237,10 +245,10 @@ export function speechActivity(samples, options = {}) {
   const {
     sampleRate = TARGET_RATE,
     frameMs = 20,
-    marginDb = 10,
+    marginDb = 16,
     minFrames = 4,
-    relaxedMarginDb = marginDb * 0.6,
-    relaxedMinFrames = minFrames * 3,
+    relaxedMarginDb = marginDb - 6,
+    relaxedMinFrames = minFrames * 6,
   } = options
   const frame = Math.max(1, Math.round((sampleRate * frameMs) / 1000))
   const levels = []
