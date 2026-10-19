@@ -126,7 +126,11 @@ export class SpeechEngine {
         inferenceSeconds: 0,
         segments: 0,
         peakDbfs: activity.peakDbfs,
+        floorDbfs: activity.floorDbfs,
         reason: 'no-speech-activity',
+        activity,
+        // Diagnostics only, and only when the model is already resident: see probeSpeechSeconds.
+        vadSpeechSeconds: this.loaded ? this.probeSpeechSeconds(samples) : null,
       }
     }
     this.load()
@@ -180,6 +184,36 @@ export class SpeechEngine {
   }
 
   /**
+   * Ask Silero how much speech a rejected recording holds, without decoding anything.
+   *
+   * The level gate is deliberately blind to what the audio *is*: it only knows that nothing rises above
+   * the noise floor. Silero is the opposite — trained on speech, but happy to call broadband noise
+   * speech. Recording both verdicts is what makes a refused dictation diagnosable later: a detector that
+   * agrees there is no speech points at the microphone, while a detector that reports a second of speech
+   * means the gate was simply too strict for how quietly the user spoke.
+   * @param {Float32Array} samples - the rejected recording.
+   * @returns {number} seconds of speech the detector reported, rounded to 10 ms.
+   */
+  probeSpeechSeconds(samples) {
+    const { detector } = this
+    detector.reset()
+    let seconds = 0
+    const drain = () => {
+      while (!detector.isEmpty()) {
+        seconds += detector.front(false).samples.length / TARGET_RATE
+        detector.pop()
+      }
+    }
+    for (let offset = 0; offset < samples.length; offset += VAD_WINDOW) {
+      detector.acceptWaveform(samples.subarray(offset, offset + VAD_WINDOW))
+      drain()
+    }
+    detector.flush()
+    drain()
+    return Math.round(seconds * 100) / 100
+  }
+
+  /**
    * Drop the native models so an idle process releases their memory.
    * @returns {boolean} whether anything was released.
    */
@@ -190,6 +224,37 @@ export class SpeechEngine {
     this.loadedAt = null
     return true
   }
+}
+
+/**
+ * Explain a refused recording in one or two lines for the log.
+ *
+ * "Nothing was recognized" is useless to the user and to whoever has to diagnose it: the interesting
+ * question is whether the microphone heard anything at all. This prints the measurement the gate made and
+ * what the two possible conclusions mean, so one look at the log separates a silent microphone from a
+ * gate that was too strict.
+ * @param {{peakDbfs?: number, activity?: object, vadSpeechSeconds?: number|null}} result - engine result.
+ * @param {{speechMarginDb?: number, minSpeechFrames?: number}} [config] - effective configuration.
+ * @returns {string[]} lines to log, without indentation.
+ */
+export function explainNoSpeech(result, config = {}) {
+  const margin = config.speechMarginDb ?? 10
+  const minFrames = config.minSpeechFrames ?? 4
+  const peak = Number.isFinite(result.peakDbfs) ? result.peakDbfs.toFixed(1) : '-inf'
+  const activity = result.activity
+  if (!activity) return [`level peak ${peak} dBFS`]
+  const lines = [
+    `level peak ${peak} dBFS, noise floor ${activity.floorDbfs.toFixed(1)} dBFS, longest run above +${margin} dB: `
+    + `${activity.longestRunFrames} frame(s), ${minFrames} needed (${activity.longestRunMs} ms of ${activity.frames * 20} ms)`,
+  ]
+  if (result.vadSpeechSeconds > 0) {
+    lines.push(`the voice detector still found ${result.vadSpeechSeconds}s of speech in it, so this was a close call: `
+      + 'speak a little louder or closer, or lower speechMarginDb in config.json')
+  } else {
+    lines.push('nothing in it stands out from its own noise floor, so it reads as room tone rather than speech: '
+      + 'check the default input device and the microphone level in 声音设置')
+  }
+  return lines
 }
 
 /**

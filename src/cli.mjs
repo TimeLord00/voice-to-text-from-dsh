@@ -8,7 +8,7 @@
  */
 import { existsSync, readFileSync, rmSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { createEngine } from './engine.mjs'
+import { createEngine, explainNoSpeech } from './engine.mjs'
 import { DEFAULTS, LANGUAGES, ROOT, loadConfig, readConfigFile, resolveModels } from './config.mjs'
 import { Dictation, keepRecording } from './dictation.mjs'
 import { runDictation } from './dictate.mjs'
@@ -63,6 +63,7 @@ const CONFIG_FLAGS = {
   port: 'port',
   token: 'token',
   beeps: 'beeps',
+  beepVolume: 'beepVolume',
   keepRecordings: 'keepRecordings',
   pasteDelayMs: 'pasteDelayMs',
   idleTimeoutMs: 'idleTimeoutMs',
@@ -200,7 +201,12 @@ async function commandTranscribe(positional, flags) {
   } else {
     process.stdout.write(`${result.text}\n`)
     // Same report as `vtt listen`: an empty result is otherwise indistinguishable from a silent file.
-    process.stdout.write(`  level ${result.peakDbfs.toFixed(1)} dBFS${result.reason === 'no-speech-activity' ? ' - nothing rose above the noise floor, so nothing was decoded' : ''}\n`)
+    // When the gate refused, its explanation already begins with the measured level.
+    if (result.reason === 'no-speech-activity') {
+      for (const line of explainNoSpeech(result, config)) process.stdout.write(`  ${line}\n`)
+    } else {
+      process.stdout.write(`  level ${result.peakDbfs.toFixed(1)} dBFS\n`)
+    }
   }
   return result.text ? 0 : 3
 }
@@ -250,13 +256,15 @@ async function commandListen(positional, flags, overrides) {
     const started = Date.now()
     engine.load()
     process.stdout.write(`model ready in ${((Date.now() - started) / 1000).toFixed(1)}s\n`)
-    if (config.beeps) beep('start')
     if (config.keepRecordings) {
       // Never a silent setting: this is the user's own voice being written to disk.
       process.stdout.write('! keepRecordings is on: the recording is also written to recordings\\\n')
     }
     process.stdout.write(`● recording ${seconds}s — speak now\n`)
     microphone.start()
+    // After the recorder is live, never before: the cue blocks for its own length (see playCue), and
+    // starting the device first is what keeps the first syllable of the sentence from being lost.
+    if (config.beeps) beep('start', config.beepVolume)
     await sleep(seconds * 1000)
     const saved = microphone.save(tempRecordingPath())
     const canonical = toCanonicalWav(readFileSync(saved.path), saved.format)
@@ -268,12 +276,13 @@ async function commandListen(positional, flags, overrides) {
       process.stdout.write(`${JSON.stringify({ text: result.text, seconds: result.audioSeconds, inferenceMs: Math.round(result.inferenceSeconds * 1000), segments: result.segments, peakDbfs: Number(result.peakDbfs.toFixed(1)), reason: result.reason ?? null, ...delivery }, null, 2)}\n`)
     } else {
       process.stdout.write(`${result.text || '(no speech recognized)'}\n`)
-      // The level is what separates "the microphone was not heard" from "the model did not like what it
-      // heard"; from the outside those two look identical.
-      process.stdout.write(`  level ${result.peakDbfs.toFixed(1)} dBFS${result.reason === 'no-speech-activity' ? ' - nothing rose above the noise floor, so nothing was decoded' : ''}\n`)
-      if (Number.isFinite(result.peakDbfs) && result.peakDbfs < -30) {
-        process.stdout.write('  ! very quiet: speak closer to the microphone, raise the input level in Windows sound settings,\n')
-        process.stdout.write('    or check which device is the default input (a quiet signal is recognized as nothing)\n')
+      // The measurement behind an empty result, so "the microphone was not heard" and "the gate refused a
+      // quiet recording" do not look identical from the outside. The explanation's first line already
+      // carries the level, so the standalone report is only printed when the gate let the audio through.
+      if (result.reason === 'no-speech-activity') {
+        for (const line of explainNoSpeech(result, config)) process.stdout.write(`  ${line}\n`)
+      } else {
+        process.stdout.write(`  level ${result.peakDbfs.toFixed(1)} dBFS\n`)
       }
       if (delivery.pasted) process.stdout.write(`(pasted into ${delivery.target || 'the focused window'})\n`)
       else if (delivery.clipboard) process.stdout.write('(copied to the clipboard)\n')
@@ -665,7 +674,11 @@ common options
   --hotkey / --cancel-hotkey        global hotkeys for dictation (default ${DEFAULTS.hotkey} / ${DEFAULTS.cancelHotkey})
   --copy / --paste                  send the text to the clipboard / paste into the focused window
   --json                            machine-readable output
-  --no-beeps                        silence the start/stop/result beeps
+  --no-beeps                        silence the start/stop/result cues
+  --beep-volume 0..1                how loud those cues are (default ${DEFAULTS.beepVolume})
+  --speech-margin-db N              how far a 20 ms frame must rise above the recording's own noise floor
+  --min-speech-frames N             and how many frames in a row must do it (defaults ${DEFAULTS.speechMarginDb} dB,
+                                    ${DEFAULTS.minSpeechFrames} frames; 0 dB decodes everything)
   --keep-recordings                 keep each recording in recordings\\ (troubleshooting; also
                                     VTT_KEEP_RECORDINGS=1 for the shortcut launchers)
 

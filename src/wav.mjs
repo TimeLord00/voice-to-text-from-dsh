@@ -204,16 +204,44 @@ export function describeCanonical(bytes) {
  * invents a sentence for it: a three-second recording of an empty room came back as
  * "小气自己写就自己写。" with nobody near the microphone (`vtt listen --seconds 3`, 2026-10-19). Silence is
  * not the only failure mode either — a quiet microphone produces the same steady noise — so the test is
- * relative to the recording itself rather than an absolute level: speech frames rise well above the
- * quietest tenth of the same recording, steady noise never does.
+ * relative to the recording itself rather than an absolute level.
+ *
+ * The signal is framed, the frames are ranked, and speech is declared when a *run* of consecutive frames
+ * stays above the tenth-percentile frame level. A run, not a count, because stationary noise always has a
+ * few frames above any threshold (measured here: room tone has 14 frames above +8 dB but they never
+ * last longer than 80 ms), while a spoken syllable is a plateau.
+ *
+ * Two rules are applied. The first is the strict one; the second accepts speech that is very quiet but
+ * long enough to be unmistakable. Measured on this machine (16 kHz mono, 20 ms frames, floor -49 dBFS):
+ *
+ *   recording                       peak      +6 dB     +10 dB    +12 dB    +16 dB
+ *   room tone                       -29.4   140 ms     20 ms      0 ms      0 ms
+ *   room tone + one click sample    -26.9   140 ms     20 ms      0 ms      0 ms
+ *   quiet voice (peak -27.8)        -27.8   260 ms    100 ms     80 ms      0 ms
+ *   normal voice (peak -22.7)       -22.7   340 ms    160 ms    140 ms    120 ms
+ *
+ * The room tone row is why the defaults are 10 dB / 4 frames: the strict rule rejects noise with a
+ * four-fold margin and still accepts a voice 20 dB quieter than normal speech, which the previous
+ * 16 dB / 5 frames version silently threw away. The relaxed rule (60% of the margin, three times the run:
+ * 6 dB over 240 ms) catches speech quieter still, and the same room tone reaches only 7 frames there.
  * @param {Float32Array} samples - mono signal in [-1, 1] at any sample rate.
- * @param {{sampleRate?: number, frameMs?: number, marginDb?: number, minFrames?: number}} [options]
- *   framing and threshold; `marginDb` 0 disables the test (everything counts as speech).
- * @returns {{peakDbfs: number, floorDbfs: number, frames: number, activeFrames: number,
- *   hasSpeech: boolean}} the measurement.
+ * @param {{sampleRate?: number, frameMs?: number, marginDb?: number, minFrames?: number,
+ *   relaxedMarginDb?: number, relaxedMinFrames?: number}} [options] framing and thresholds; `marginDb` 0
+ *   disables the test (everything counts as speech). The relaxed rule defaults to 60% of the margin and
+ *   three times the run.
+ * @returns {{peakDbfs: number, floorDbfs: number, medianDbfs: number, p90Dbfs: number, frames: number,
+ *   activeFrames: number, longestRunFrames: number, longestRunMs: number, relaxedRunFrames: number,
+ *   relaxedRunMs: number, hasSpeech: boolean}} the measurement.
  */
 export function speechActivity(samples, options = {}) {
-  const { sampleRate = TARGET_RATE, frameMs = 20, marginDb = 12, minFrames = 3 } = options
+  const {
+    sampleRate = TARGET_RATE,
+    frameMs = 20,
+    marginDb = 10,
+    minFrames = 4,
+    relaxedMarginDb = marginDb * 0.6,
+    relaxedMinFrames = minFrames * 3,
+  } = options
   const frame = Math.max(1, Math.round((sampleRate * frameMs) / 1000))
   const levels = []
   let peak = 0
@@ -232,16 +260,40 @@ export function speechActivity(samples, options = {}) {
     if (magnitude > peak) peak = magnitude
   }
   const sorted = [...levels].sort((a, b) => a - b)
-  const floor = sorted[Math.floor(sorted.length * 0.1)] ?? 0
-  const threshold = floor * 10 ** (marginDb / 20)
+  const quantile = (q) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] ?? 0
+  const floor = quantile(0.1)
   // The absolute floor keeps digital silence and dither from counting as speech at any margin.
-  const activeFrames = marginDb <= 0 ? levels.length : levels.filter((level) => level > threshold && level > 0.001).length
+  const threshold = (db) => Math.max(floor * 10 ** (db / 20), 0.001)
+  const countAbove = (value) => levels.filter((level) => level > value).length
+  const longestRun = (value) => {
+    let longest = 0
+    let current = 0
+    for (const level of levels) {
+      if (level > value) {
+        current += 1
+        if (current > longest) longest = current
+      } else current = 0
+    }
+    return longest
+  }
   const toDbfs = (value) => (value > 0 ? 20 * Math.log10(value) : Number.NEGATIVE_INFINITY)
+  const disabled = marginDb <= 0
+  const longestRunFrames = disabled ? levels.length : longestRun(threshold(marginDb))
+  const relaxedRunFrames = disabled ? levels.length : longestRun(threshold(relaxedMarginDb))
+  const hasSpeech = disabled || (levels.length > 0
+    ? longestRunFrames >= minFrames || (relaxedMinFrames > 0 && relaxedRunFrames >= relaxedMinFrames)
+    : peak > 0.001)
   return {
     peakDbfs: toDbfs(peak),
     floorDbfs: toDbfs(floor),
+    medianDbfs: toDbfs(quantile(0.5)),
+    p90Dbfs: toDbfs(quantile(0.9)),
     frames: levels.length,
-    activeFrames,
-    hasSpeech: levels.length === 0 ? peak > 0.001 : activeFrames >= minFrames,
+    activeFrames: disabled ? levels.length : countAbove(threshold(marginDb)),
+    longestRunFrames,
+    longestRunMs: longestRunFrames * frameMs,
+    relaxedRunFrames,
+    relaxedRunMs: relaxedRunFrames * frameMs,
+    hasSpeech,
   }
 }

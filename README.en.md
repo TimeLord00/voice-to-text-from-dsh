@@ -102,8 +102,9 @@ Common flags: `--language zh|en|yue|ja|ko|auto`, `--no-paste` (clipboard only), 
   "minSeconds": 0.6,
   "pasteDelayMs": 120,
   "beeps": true,
-  "speechMarginDb": 16,
-  "minSpeechFrames": 5,
+  "beepVolume": 0.7,
+  "speechMarginDb": 10,
+  "minSpeechFrames": 4,
   "keepRecordings": false,
   "overlay": {
     "size": 46,
@@ -126,11 +127,26 @@ Common flags: `--language zh|en|yue|ja|ko|auto`, `--no-paste` (clipboard only), 
 
 ## Silence safety (why it does not type nonsense)
 
-SenseVoice happily invents fluent sentences out of room tone — measured here: 3 seconds of an empty room decoded to a full Chinese sentence. Before every transcription the tool measures 20 ms frame levels and refuses to call the model when no frame rises `speechMarginDb` (16 dB) above that recording's own noise floor, returning `reason: "no-speech-activity"` with the measured `level ... dBFS`. The test is relative, so quiet-but-real speech is not thrown away; `--speech-margin-db 0` disables it.
+SenseVoice happily invents fluent sentences out of room tone — measured here: 3 seconds of an empty room decoded to a full Chinese sentence. Before every transcription the tool measures 20 ms frame levels and refuses to call the model unless `minSpeechFrames` consecutive frames (4 = 80 ms) rise `speechMarginDb` (10 dB) above that recording's own noise floor, returning `reason: "no-speech-activity"` with the measured `level ... dBFS` and the run it found. A relaxed second rule (240 ms at 6 dB) catches very quiet speech. The test is relative, so quiet-but-real speech is not thrown away — the previous 16 dB default did throw away a voice 20 dB below normal speech, which is one way the tool could look like it did nothing at all:
+
+| recording | peak | longest run at +6 dB | longest run at +10 dB |
+| --- | --- | --- | --- |
+| empty room | -29 … -30 dBFS | 120-140 ms | 20 ms (1 frame) |
+| room + one click sample | -26.9 dBFS | 140 ms | 20 ms |
+| very quiet voice (20 dB below normal) | -27.8 dBFS | 260 ms | 100 ms (5 frames) |
+| normal voice | -22.7 dBFS | 340 ms | 160 ms |
+
+`--speech-margin-db 0` disables the gate. Every result prints the level and, when the gate refuses, what it measured and which of the two conclusions applies (no sound at all vs. speech that was simply too quiet).
+
+## Feedback sounds
+
+The four cues (start, stop, done, error) are synthesized by this project rather than borrowed from the Windows sound scheme, so they cannot be confused with another program's notifications and do not change with the user's scheme. Play them yourself with `node probe/cue-check.mjs`, which writes them to `test-output/cues/`. `--no-beeps` silences them, `--beep-volume 0..1` (default 0.7) changes how loud they are; if the output device refuses the buffer, the tool falls back to the plain Windows sound instead of going silent.
+
+They are also played **synchronously**, which is not an accident: with `SND_ASYNC`, a cue still playing when the MCI mapper opens the capture device makes `mciSendStringW('record')` never return — the process freezes with no error, no log line and no way out but Task Manager (`vtt listen` reproduced it on the first run). `probe/cue-capture-probe.mjs` walks one playback technique per mode through a real recording: every asynchronous variant deadlocks, every blocking variant completes. Blocking costs at most 233 ms, and `npm test` runs the probe in a child process with a timeout, so a hang fails the suite instead of hanging it.
 
 ## Verified on
 
-Windows 10 22H2 (19045) x64, Node 24.19, SenseVoice int8 — real dictation pasted into a browser and an editor, plus a measured room-tone rejection. `npm test` runs four suites (HTTP API, global hotkey + resident process, overlay window/mouse semantics, tray menu structure); `vtt doctor` checks platform, models, recognizer load, microphone capture, clipboard round trip and hotkey registration.
+Windows 10 22H2 (19045) x64, Node 24.19, SenseVoice int8 — real dictation pasted into a browser and an editor, plus a measured room-tone rejection. `npm test` runs five suites (audio gate + cues + the cue/recorder deadlock, HTTP API, global hotkey + resident process, overlay window/mouse semantics, tray menu structure); `vtt doctor` checks platform, models, recognizer load, microphone capture, clipboard round trip and hotkey registration.
 
 Two honest caveats: `Shell_NotifyIcon` is refused with `error 5` inside low-integrity sessions (sandboxes, some CI), so the tray icon can only be confirmed on a real desktop — `probe/tray-probe.mjs` tells the two cases apart; and injected mouse/keyboard input is swallowed in some sessions, so the click and drag rules are tested through an injectable pointer seam (`MicButton`'s `pointerAt`) plus posted window messages rather than with synthetic hardware events.
 
@@ -138,7 +154,8 @@ Two honest caveats: `Shell_NotifyIcon` is refused with `error 5` inside low-inte
 
 | symptom | what to do |
 | --- | --- |
-| Recording works but the text is empty | Look at the printed `level ... dBFS`: real speech should be clearly above −20 dBFS. Below −30 the microphone is not hearing you — check mute, Windows privacy settings, the default input device, and raise the input level. |
+| Recording works but the text is empty | The result now prints the measurement and the gate''s verdict: `longest run above +10 dB: N frame(s), 4 needed` plus either `nothing in it stands out from its own noise floor` (the microphone is not hearing you — check mute, Windows privacy settings, the default input device, raise the input level) or `the voice detector still found N s of speech` (you spoke, just too quietly for the gate: retry with `--speech-margin-db 8`). |
+| A word or two sometimes produces nothing at all | That is what the gate does when the speech is too quiet: it refuses to decode rather than let the model invent a sentence out of room tone. The old default (16 dB above the floor) threw away a voice 20 dB below normal speech; the current one (10 dB, 4-frame run, plus a 6 dB/240 ms relaxed rule) is measured against real recordings. Every refusal is now explained in the log, and `--keep-recordings` keeps the audio so `node probe/gate-sweep.mjs <file>` can show which margin it would pass. |
 | The first words are missing | The banner prints `microphone ready in Nms` (a warm-up capture at start-up). Wait for the icon to turn red before talking. |
 | `Cannot register the global hotkey ...` | Another application owns it (a voice-input plugin often does). Pass `--hotkey ctrl+alt+d`. `vtt overlay` only warns and keeps working. |
 | The button is gone | It does not hide by itself; check `overlay.log` and Task Manager for a leftover `node.exe`. A second launch revives a running button. |

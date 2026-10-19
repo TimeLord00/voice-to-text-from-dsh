@@ -117,7 +117,16 @@ node .\bin\vtt.mjs serve --port 8791
 | `ctrl+alt+escape` | 放弃这次录音（不识别，并还原剪贴板） |
 | `Ctrl+C`（在该终端窗口） | 退出 |
 
-听写过程中会有系统提示音：开始一声、结束一声、识别为空时是错误音。提示音用于你正盯着别的窗口时确认状态，`--no-beeps` 可以关掉。
+听写有四个提示音，都是本项目自己合成的（不是 Windows 声音方案里的那几个，所以不会和别的软件撞声）：
+
+| 声音 | 什么时候响 | 听感 |
+| --- | --- | --- |
+| 开始 | 开始录音 | 两声上行（E5 → A5），146 ms |
+| 结束 | 你按下结束后，正在识别 | 一声低音（G4），90 ms |
+| 完成 | 识别出文字、已粘贴 | 三声快速上行（E5 → G5 → C6），162 ms |
+| 失败 | 识别为空，或录音太短被丢弃 | 两声下行（A4 → F4），233 ms |
+
+`--no-beeps` 关掉全部提示音，`--beep-volume 0..1`（配置项 `beepVolume`，默认 0.7）只调音量。想先听听：`node probe\cue-check.mjs` 会把四个 wav 写到 `test-output\cues\`，双击即可试听。喇叭被静音或没有输出设备时，会自动退回 Windows 默认提示音，不会没声音也不报错。
 
 ---
 
@@ -220,7 +229,9 @@ vtt config  [--init] [--force] [--json]
 | `--copy` / `--paste` | 关 / 关 | 一次性命令是否把结果放进剪贴板 / 粘贴到焦点窗口 |
 | `--json` | 关 | 输出机器可读的 JSON |
 | `--model-dir` / `--vad-path` | 自动 | 手动指定模型位置 |
-| `--speech-margin-db` / `--min-speech-frames` | `16` / `5` | 一段录音里 20 ms 帧要高出自身底噪多少 dB、至少多少帧，才值得送去识别；设 `--speech-margin-db 0` 关掉这道闸门（静音也照解码，用来看模型到底「听」到了什么） |
+| `--speech-margin-db` / `--min-speech-frames` | `10` / `4` | 一段录音里 20 ms 帧要**连续**多少帧高出自身底噪多少 dB，才值得送去识别（`4` 帧 = 80 ms；另有 6 dB / 240 ms 的放宽档）。设 `--speech-margin-db 0` 关掉这道闸门（静音也照解码，用来看模型到底「听」到了什么） |
+| `--beeps` / `--beep-volume` | 开 / `0.7` | 四个自定义提示音的开关与音量（0..1）；`node probe\cue-check.mjs` 可以把它们导出成 wav 试听 |
+| `--keep-recordings` | 关 | 把每次录音留一份到 `recordings\` 用于排查（也支持 `VTT_KEEP_RECORDINGS=1`） |
 
 退出码：`0` 成功，`1` 运行错误，`3` 没识别到内容，`4` 模型缺失，`5` 自检发现问题。
 
@@ -307,6 +318,9 @@ Get-ChildItem *.wav | ForEach-Object { vtt transcribe $_.FullName --json }
   "minSeconds": 0.6,
   "pasteDelayMs": 120,
   "beeps": true,
+  "beepVolume": 0.7,
+  "speechMarginDb": 10,
+  "minSpeechFrames": 4,
   "keepRecordings": false,
   "port": 8791,
   "token": null,
@@ -337,7 +351,8 @@ Get-ChildItem *.wav | ForEach-Object { vtt transcribe $_.FullName --json }
 | `minSeconds` | 短于该时长视为误触，直接丢弃 |
 | `pasteDelayMs` | 粘贴前的等待毫秒数；某些应用需要更大值才能接住按键 |
 | `keepRecordings` | 把每次录音留一份到 `recordings\`，**只用于排查**「识别为空/识别错」；默认关闭，打开时启动横幅和每次结果都会明确写出来（`! recordings are being kept ...`）。也可用环境变量 `VTT_KEEP_RECORDINGS=1`（给双击快捷方式的场景用） |
-| `speechMarginDb` / `minSpeechFrames` | 「值不值得送去识别」的闸门：20 ms 帧要高出该录音自身底噪多少 dB（默认 16）、至少几帧（默认 5）。防的是**静音乱说话**：模型会对着纯底噪编出一句通顺的中文，而悬浮按钮会把这句话粘进你正在写的东西里。设 `0` 关闭 |
+| `beeps` / `beepVolume` | 自定义提示音开关（默认开）与音量（默认 0.7，0..1） |
+| `speechMarginDb` / `minSpeechFrames` | 「值不值得送去识别」的闸门：20 ms 帧要高出该录音自身底噪多少 dB（默认 10）、并且**连续**多少帧做到（默认 4，即 80 ms）才算有人说话。防的是**静音乱说话**：模型会对着纯底噪编出一句通顺的中文，而悬浮按钮会把这句话粘进你正在写的东西里。另有放宽档（默认 6 dB 连续 240 ms）兜住特别轻的说话。设 `speechMarginDb` 为 0 关闭 |
 | `token` | 设置后 HTTP 接口要求 `Authorization: Bearer <token>`（默认只监听 127.0.0.1） |
 | `overlay.size` / `gap` | 悬浮按钮的直径、与光标之间的间距（逻辑像素，会再乘以显示缩放） |
 | `overlay.follow` / `followIntervalMs` | 是否跟着光标走、多久检查一次位置（默认 400 ms，只在位置真的变了才挪） |
@@ -397,17 +412,20 @@ DSH 缓存 `%USERPROFILE%\.dsh\speech-to-text\sensevoice\models`。
 
 ## 自检与已验证行为
 
-`npm test` 会跑四组无需人耳的自动化测试（都在本机上跑通）：
+`npm test` 会跑五组无需人耳的自动化测试（都在本机上跑通）：
 
 | 测试 | 覆盖内容 |
 | --- | --- |
+| `npm run test:audio` | 语音闸门：固定底噪 + 已知高度的音块，逐条验证「稳态噪声被拒」「单个采样点的咔哒声不算说话」「220 ms 的短词 12 dB 过关」「60 ms 的咔哒太短」「9 dB 的轻声靠放宽档过关」「4 dB 仍然被拒」「`marginDb 0` 关闭闸门」；四个提示音的时长、峰值、首尾静音、两两不同、WAV 头、音量缩放；以及**提示音不会毒死录音器**：先测「播放期间不返回就是异步播放又回来了」，再在一个**带超时的子进程**里跑 `probe\cue-capture-probe.mjs`，先播音再录音，卡死就判失败（详下） |
 | `npm run test:menu` | 托盘菜单：中文措辞与顺序、命令 id 不重复、隐藏 / 显示文案随状态翻转、提示文字；并把菜单**真的建出来**，用 `GetMenuStringW` 把每项读回来逐字节比对 UTF-16（防止菜单乱码） |
 | `npm run test:server` | 起真实 HTTP 服务：`/health`、`/transcribe`（raw WAV 与 multipart 两种）、`/v1/audio/transcriptions`、参数校验、鉴权 token、404/413/415/400 错误映射、导出、`/dictate` 重复开始冲突、关闭与重启 |
 | `npm run test:hotkey` | 真实注册全局热键 → 用 PostMessage 投递 WM_HOTKEY → 校验消息泵回调与去重；验证非 WAV 文件被拒；启动真正的 `vtt dictate` 命令确认它是**常驻**的（不会打印完 banner 就退出），并确认停止后进程能自行退出（没有残留句柄） |
 | `npm run test:overlay` | 四个状态的图标像素（尺寸、透明度、可见像素）、放置规则（贴光标 / 靠右翻边 / 无光标退到鼠标 / 不出屏）、跟随规则（鼠标死区内冻结、拖动优先、固定后不再跟随、`hideWithoutCaret` 开关与宽限时间、三条安全兜底）、**拖动判定**（指针真的移动了才算拖动；窗口一直停在指针下面、客户区坐标没变的那种几何也算拖动 —— 这正是「一拖就开始录音」的成因）、通知区域图标（结构体尺寸 1360、渲染、随状态换图、加入与移除、中文菜单项与提示文字、菜单项 id）、真实窗口上的点击 / 悬停 / 拖动 / 右键取消 / 中键只隐藏不退出 / 复活消息，以及**启动真正的 `vtt overlay` 进程**：从外部找到按钮窗口、投递点击、确认识别结果、用中键从外部确认它真的从屏幕上消失（`IsWindowVisible`）再叫回来、再用 `vtt overlay --stop` 关闭并断言退出码是 `0`（不崩溃）；热键被别的进程占用时按钮照样出现 |
 
-其中 overlay 这一组还顺带锁定了一个真实崩溃：消息处理是在 Win32 回调栈上执行的，如果在里面直接做录音/推理，进程会以
-`0xC0000005` 退出。现在窗口过程只判断「发生了什么」，真正的工作放到下一个事件循环 tick，退出前也会等正在进行的识别落地。
+其中两组测试各自锁定了一个真实故障：
+
+- **overlay** 组锁定了崩溃：消息处理是在 Win32 回调栈上执行的，如果在里面直接做录音/推理，进程会以 `0xC0000005` 退出。现在窗口过程只判断「发生了什么」，真正的工作放到下一个事件循环 tick，退出前也会等正在进行的识别落地。
+- **audio** 组锁定了死锁：`PlaySound` 用 `SND_ASYNC` 异步播放时，如果这段声音还没播完就去打开 MCI 录音设备，`mciSendStringW('record')` **永远不会返回** —— 整个进程静静地卡死，没有报错、没有日志、只能去任务管理器结束它（`vtt listen` 第一次跑就复现了：打印完「recording」就再也没动静）。现在提示音一律**同步播放**（最长 233 ms），由构造保证不会残留异步播放状态；`probe\cue-capture-probe.mjs` 把每种播放方式各跑一遍「播放 → 录音 → 保存」，异步的那几种全部卡死、同步的全部通过，测试用例就是它。
 
 `vtt doctor` 在本机的结果：平台 Windows x64 / Node 20+ ✓、模型三件套校验通过（复用 DSH 缓存）✓、
 识别引擎自检（静音输入 → 空文本，无异常）✓、麦克风可打开且能测到电平 ✓、剪贴板往返 ✓、全局热键可注册 ✓。
@@ -442,8 +460,8 @@ node .\bin\vtt.mjs listen --seconds 6      # 对着麦克风说“今天天气�
 | 现象 | 原因与处理 |
 | --- | --- |
 | `Cannot register the global hotkey ctrl+alt+space` | `vtt dictate` 会直接报错退出：该热键已被别的程序占用（本机上就是 DSH 语音输入插件）。换一个：`--hotkey ctrl+alt+d`。`vtt overlay` 不会因此罢工：日志里写一行、横幅标注 `unavailable`，**悬浮按钮照常工作** —— 按钮才是它的交互方式 |
-| 录制成功但识别为空 | 现在每次结果都会打印电平（`level -27.5 dBFS`）和原因（`no-speech-activity` = 整段录音里没有任何一帧高过它自己的底噪，压根没送给模型）。**先看这个数**：正常说话应该明显高于 -20 dBFS；只有 -30 以下就是麦克风没收到声音 —— 麦克风静音/被 Windows 隐私设置拦截/没选对默认输入设备。还查不出来就加 `--keep-recordings`，每次录音会留在 `recordings\`，可以自己放来听，用 `node probe\wav-level.mjs <文件>` 看峰值/底噪，或再用 `vtt transcribe <文件>` 复现 |
-| 什么都没说，却粘出来一句莫名其妙的话 | 这是模型对纯底噪的**幻觉**（SenseVoice 会对着静音编一句通顺的中文），已由 `speechMarginDb` 闸门挡住：没有一帧高出底噪 16 dB 就不解码，直接报「没识别到」。想亲眼看见幻觉：`vtt transcribe recordings\<那次录音>.wav --speech-margin-db 0` |
+| 录制成功但识别为空 | 每次结果都会打印电平（`level -27.5 dBFS`）和闸门判词（`no-speech-activity`），接着两行测量细节：`longest run above +10 dB: 1 frame(s), 4 needed` 和两个结论之一 —— `nothing in it stands out from its own noise floor ... 看起来就是环境底噪`（麦克风没收到声音：静音、被 Windows 隐私设置拦截、默认输入设备选错、或离麦太远）或 `the voice detector still found N s of speech in it`（确实说了话，只是太轻，闸门差一点放过）。**第二种**就调 `--speech-margin-db 8`（或更低）重试，并把麦克风加强调高。要确诊就加 `--keep-recordings`：每次录音留在 `recordings\`，可以自己放来听、`node probe\wav-level.mjs <文件>` 看峰值/底噪、`node probe\gate-sweep.mjs <文件>` 看它在各档位下是否过关 |
+| 什么都没说，却粘出来一句莫名其妙的话 | 这是模型对纯底噪的**幻觉**（SenseVoice 会对着静音编一句通顺的中文），已由 `speechMarginDb` 闸门挡住：没有任何「连续 4 帧（80 ms）」高出底噪 10 dB 就不解码，直接报「没识别到」。想亲眼看见幻觉：`vtt transcribe recordings\<那次录音>.wav --speech-margin-db 0` |
 | 粘贴没发生，但剪贴板有字 | 目标窗口是管理员权限（UIPI），手动 `Ctrl+V`；或把本工具也以管理员身份运行 |
 | 识别很慢 | 提高线程 `--threads 4`；或改用更短的录音；CPU 推理 1 秒音频通常远快于 1 秒 |
 | 中文夹杂英文识别不准 | `--language auto`；`zh` 会强制按中文解码 |
@@ -477,13 +495,23 @@ Silero VAD 切分 → SenseVoiceSmall (sherpa-onnx, CPU) → 文本
 
 几个刻意的设计取舍：
 
-- **不启动子进程**。录音、剪贴板、热键、按键注入、悬浮窗口全部通过 `koffi` 在本进程内直接调用 Win32 API。省掉 ffmpeg / PowerShell 依赖，冷启动更快，也不会与受限环境的子进程策略冲突。
+- **不启动子进程**。录音、剪贴板、热键、按键注入、悬浮窗口全部通过 `koffi` 在本进程内直接调用 Win32 API。省掉 ffmpeg / PowerShell 依赖，冷启动更快，也不会与受限环境的子进程策略冲突。（唯一的例外是测试：死锁那种「同步调用不返回」的故障没法在自己进程里超时，所以 `test:audio` 用一个带超时的子进程去证明它没卡住。）
+- **提示音同步播放，而且是自己合成的**。四个提示音由 `src/sound.mjs` 生成几毫秒粒度的 WAV 内存镜像，用 `PlaySound(SND_MEMORY)` **阻塞**播放完再返回。异步播放（`SND_ASYNC`）配上 MCI 录音会死锁，同步的代价只有 90-233 ms；音量可调、可整体关闭，设备拒收时退回系统提示音，所以反馈永远不会静默消失。
 - **窗口是「分层窗口」而不是普通窗口**：`WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`，用 `UpdateLayeredWindow` 逐像素画抗锯齿的圆和麦克风图形，鼠标命中由每条 `WM_MOUSEMOVE` 自己算。`WS_EX_NOACTIVATE` 是关键 —— 点按钮**不会抢走焦点**，否则「粘贴到光标处」就无从谈起（焦点一丢，光标就没了）。同一个窗口还带一个 `HTCLIENT` + `MA_NOACTIVATE` 的命中测试，确保点击不会激活它。
 - **画在哪儿不猜**：`GetGUIThreadInfo` 读前台线程的插入符矩形（拿不到就退到鼠标位置），只在光标旁边画。
 - **消息处理不在回调里干活**：窗口过程只记录发生了什么，录音和识别放到下一个事件循环 tick（见上面的崩溃说明）。
 - **采集格式固定 48 kHz/16-bit/立体声**。Windows 的 MCI waveaudio 映射器只接受这一种格式（其他采样率/声道组合会返回 MCI 错误 282），而且它会往文件头写错误的 `byteRate`，所以真实格式以 `status` 查询结果为准，转换时显式覆盖。
 - **识别在本地 CPU 上跑**，模型常驻内存（int8 约 250 MB）。首次 `load()` 需要若干秒，之后单次识别是百毫秒级。
-- **静音不乱说话**：识别前先量一遍 20 ms 帧的电平，没有任何一帧高出这段录音自身底噪 16 dB 就直接返回空文本（`reason: no-speech-activity`），压根不送模型。这条是实测出来的 —— 一段 3 秒的空房间录音被 SenseVoice 解码成了一句通顺的中文「小气自己写就自己写。」，而悬浮按钮会把这句话粘进用户正在写的东西里。判断是**相对**的（跟录音自己的底噪比）而不是绝对音量，所以安静环境里的正常说话不会被误伤；每次结果都会打印 `level ... dBFS`，闸门开合有据可查（`--speech-margin-db 0` 可关闭）。
+- **静音不乱说话，但轻说话不能误杀**：识别前先量一遍 20 ms 帧的电平，要求**连续 4 帧（80 ms）高出这段录音自身底噪 10 dB**，否则直接返回空文本（`reason: no-speech-activity`），压根不送模型；另有放宽档（连续 240 ms 高出 6 dB）兜住特别轻的说话。这条是实测出来的 —— 一段 3 秒的空房间录音被 SenseVoice 解码成了一句通顺的中文「小气自己写就自己写。」，而悬浮按钮会把这句话粘进用户正在写的东西里。判断是**相对**的（跟录音自己的底噪比）而不是绝对音量，所以安静环境里的正常说话不会被误伤。默认值也是量出来的（`node probe\gate-sweep.mjs --synth`，本机实测）：
+
+  | 录音 | 峰值 | +6 dB 最长连续 | +10 dB 最长连续 |
+  | --- | --- | --- | --- |
+  | 空房间底噪 | -29 ~ -30 dBFS | 120-140 ms | 20 ms（1 帧） |
+  | 底噪 + 一个采样点的咔哒声 | -26.9 dBFS | 140 ms | 20 ms |
+  | 很轻的说话（比正常轻 20 dB） | -27.8 dBFS | 260 ms | 100 ms（5 帧） |
+  | 正常说话 | -22.7 dBFS | 340 ms | 160 ms |
+
+  旧的默认（16 dB / 5 帧）会把第三行那种「很轻的说话」整段丢掉 —— 也就是说：**说话太轻时，工具当时是静默地什么都没做**，这正是「偶尔两三次没反应，之后又好了」的一种成因；改成现在这组默认值后同一段录音会被解码。每次结果都会打印 `level ... dBFS` 和闸门判词，`--speech-margin-db 0` 可关闭闸门。
 
 ### 目录结构
 

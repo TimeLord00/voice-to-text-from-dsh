@@ -26,7 +26,8 @@
   },
   "scripts": {
     "doctor": "node ./bin/vtt.mjs doctor",
-    "test": "node ./test/menu-selftest.mjs && node ./test/server-selftest.mjs && node ./test/hotkey-selftest.mjs && node ./test/overlay-selftest.mjs",
+    "test": "node ./test/audio-selftest.mjs && node ./test/menu-selftest.mjs && node ./test/server-selftest.mjs && node ./test/hotkey-selftest.mjs && node ./test/overlay-selftest.mjs",
+    "test:audio": "node ./test/audio-selftest.mjs",
     "test:menu": "node ./test/menu-selftest.mjs",
     "test:server": "node ./test/server-selftest.mjs",
     "test:hotkey": "node ./test/hotkey-selftest.mjs",

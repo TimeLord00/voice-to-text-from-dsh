@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import { ROOT } from './config.mjs'
 import { Microphone, beep, copyText, foregroundWindowTitle, readClipboardText, sendPaste, tempRecordingPath } from './win32.mjs'
 import { canonicalToFloat, describeCanonical, speechActivity, toCanonicalWav } from './wav.mjs'
+import { explainNoSpeech } from './engine.mjs'
 
 /** States a dictation session can be in. */
 export const DictationState = { Idle: 'idle', Recording: 'recording', Transcribing: 'transcribing' }
@@ -83,7 +84,7 @@ export class Dictation {
     const captureMs = Date.now() - startedAt
     this.previousClipboard = this.clipboard ? readClipboardText() : null
     this.setState(DictationState.Recording)
-    if (this.beeps) beep('start')
+    if (this.beeps) beep('start', this.config.beepVolume)
     // How long the device took to start streaming: the user's "the first time it cannot hear me" is a
     // question about exactly this number, so it belongs in the log rather than in a support round trip.
     this.log(`● recording (max ${this.config.maxSeconds}s, capture live after ${captureMs}ms)`)
@@ -113,7 +114,7 @@ export class Dictation {
     try {
       if (seconds < this.config.minSeconds) {
         this.microphone.discard()
-        if (this.beeps) beep('error')
+        if (this.beeps) beep('error', this.config.beepVolume)
         throw new Error(`Recording was only ${seconds.toFixed(1)}s (shorter than ${this.config.minSeconds}s); ignored`)
       }
       const saved = this.microphone.save(path)
@@ -132,10 +133,17 @@ export class Dictation {
     if (this.config.keepRecordings) this.log(`  kept the recording at ${keepRecording(canonical)}`)
     this.log(`… transcribing ${size.seconds.toFixed(1)}s of audio (peak ${peakDbfs.toFixed(1)} dBFS)`)
     const result = this.engine.transcribe(canonical, this.config.language)
+    // The engine refuses to decode a recording that is nothing but its own noise floor. That refusal is
+    // correct but opaque — "nothing was recognized" for a user who just spoke is the complaint that
+    // started this — so the measurement behind the decision goes into the log, including the detector's
+    // second opinion when the model happened to be resident.
+    if (!result.text && result.reason === 'no-speech-activity') {
+      for (const line of explainNoSpeech(result, this.config)) this.log(`  ${line}`)
+    }
     const delivery = await this.deliver(result.text)
     this.setState(DictationState.Idle)
     this.lastResult = { ...result, ...delivery, format, peakDbfs }
-    if (this.beeps) beep(result.text ? 'done' : 'error')
+    if (this.beeps) beep(result.text ? 'done' : 'error', this.config.beepVolume)
     if (this.onText) this.onText(this.lastResult)
     return this.lastResult
   }
@@ -169,7 +177,7 @@ export class Dictation {
     this.microphone?.close()
     if (this.clipboard && this.previousClipboard !== null) copyText(this.previousClipboard)
     this.setState(DictationState.Idle)
-    if (this.beeps) beep('stop')
+    if (this.beeps) beep('stop', this.config.beepVolume)
     this.log(`✕ discarded ${seconds.toFixed(1)}s`)
     return { state: this.state, seconds }
   }

@@ -71,13 +71,17 @@ export const DEFAULTS = {
    *
    * The recognizer answers steady room tone with an invented sentence, and the floating button pastes
    * whatever comes back, so a recording with nothing above this margin is reported as empty instead of
-   * decoded. Measured on this machine (see probe/wav-level.mjs, which uses a stricter 20 dB for its
-   * verdict): three seconds of an empty room reach 3 frames at 12 dB and none at 16 dB, while speech
-   * frames sit 20-40 dB above the pauses in the same recording. 0 disables the test and always decodes.
+   * decoded. The default is a compromise measured on this machine (see probe/gate-sweep.mjs): room tone
+   * peaks 140 ms above its own floor at +6 dB and 20 ms at +10 dB, while a quiet voice 20 dB below normal
+   * speech still holds 100 ms at +10 dB. The older 16 dB threw that quiet voice away. 0 disables the test
+   * and always decodes.
    */
-  speechMarginDb: 16,
-  /** Frames that must clear {@link speechMarginDb} before a recording is worth decoding (100 ms). */
-  minSpeechFrames: 5,
+  speechMarginDb: 10,
+  /**
+   * Consecutive frames that must clear {@link speechMarginDb} before a recording is worth decoding
+   * (4 frames = 80 ms). A run rather than a total, because stationary noise always has a few loud frames.
+   */
+  minSpeechFrames: 4,
   /** Global hotkey that starts and stops dictation. */
   hotkey: 'ctrl+alt+space',
   /** Global hotkey that discards an in-flight recording. */
@@ -88,8 +92,10 @@ export const DEFAULTS = {
   minSeconds: 0.6,
   /** Delay between writing the clipboard and injecting Ctrl+V. */
   pasteDelayMs: 120,
-  /** Keep the system beeps that signal start/stop/result. */
+  /** Play the start/stop/result cues. They are synthesized here, not Windows sound-scheme entries. */
   beeps: true,
+  /** Loudness of those cues, 0..1. */
+  beepVolume: 0.7,
   /**
    * Keep a copy of every recording in `recordings/`. Off by default: a dictation tool should not
    * leave the user's voice on disk unless asked. Turn it on when a result looks wrong.

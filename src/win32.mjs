@@ -18,6 +18,7 @@ import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import koffi from 'koffi'
+import { CUE_KINDS, DEFAULT_CUE_VOLUME, renderCue } from './sound.mjs'
 
 /** MCI recording format: the only one the waveaudio mapper accepts here. */
 export const MIC_FORMAT = { sampleRate: 48000, channels: 2, bitsPerSample: 16 }
@@ -27,6 +28,11 @@ const CF_UNICODETEXT = 13
 const KEYEVENTF_KEYUP = 0x0002
 const PM_REMOVE = 0x0001
 const WM_HOTKEY = 0x0312
+/** PlaySound flags: our cue lives in memory and must never fall back to a sound-scheme entry. */
+const SND_NODEFAULT = 0x0002
+const SND_MEMORY = 0x0004
+/** Rendered cue images, keyed by `kind@volume`: rendering per click would be wasted work. */
+const cueCache = new Map()
 const MOD_ALT = 0x0001
 const MOD_CONTROL = 0x0002
 const MOD_SHIFT = 0x0004
@@ -54,6 +60,7 @@ function native() {
     koffi,
     mciSendStringW: winmm.func('unsigned int mciSendStringW(const char16_t *command, _Out_ char16_t *result, unsigned int resultLength, void *callback)'),
     mciGetErrorStringW: winmm.func('int mciGetErrorStringW(unsigned int error, _Out_ char16_t *buffer, unsigned int length)'),
+    PlaySoundW: winmm.func('int PlaySoundW(void *sound, void *module, unsigned int flags)'),
     RegisterHotKey: user32.func('int RegisterHotKey(void *window, int id, unsigned int modifiers, unsigned int key)'),
     UnregisterHotKey: user32.func('int UnregisterHotKey(void *window, int id)'),
     PeekMessageW: user32.func('int PeekMessageW(_Out_ void *message, void *window, unsigned int filterMin, unsigned int filterMax, unsigned int remove)'),
@@ -491,12 +498,49 @@ export function foregroundWindowTitle() {
 }
 
 /**
- * Play a short system sound. Beeps are the only feedback channel a console tool has while the user
- * looks at another window, which is exactly when dictation happens.
+ * Play one of the synthesized dictation cues (see src/sound.mjs).
+ *
+ * **Blocking, deliberately** (no `SND_ASYNC`). Measured on this machine: an asynchronous PlaySound that
+ * is still playing when the MCI mapper opens the capture device makes `mciSendStringW('record')` never
+ * return — the whole process freezes with no error, no log line and no way to recover, and it reproduced
+ * on the very first try (`vtt listen` played its start cue, printed "recording", then hung forever).
+ * `probe/cue-capture-probe.mjs` walks one playback technique per mode through a real recording; every
+ * asynchronous variant deadlocks, every blocking variant completes, whether the cue precedes the
+ * recorder or plays while it is already running. A cue is 90-233 ms, so blocking costs at most that.
+ * @param {'start'|'stop'|'done'|'error'} kind - which cue to play.
+ * @param {number} [volume] - 0..1 peak scale, default {@link DEFAULT_CUE_VOLUME}.
+ * @returns {boolean} whether the audio device accepted the buffer.
+ */
+export function playCue(kind, volume = DEFAULT_CUE_VOLUME) {
+  if (!CUE_KINDS.includes(kind)) return false
+  const key = `${kind}@${volume}`
+  let wav = cueCache.get(key)
+  if (!wav) {
+    wav = renderCue(kind, { volume })
+    cueCache.set(key, wav)
+  }
+  try {
+    return native().PlaySoundW(wav, null, SND_MEMORY | SND_NODEFAULT) !== 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Play the short sound that tells the user what dictation is doing. Beeps are the only feedback channel
+ * a tool with no window of its own has while the user looks at another application, which is exactly
+ * when dictation happens.
+ *
+ * These are our own synthesized cues rather than Windows sound-scheme entries, because the scheme sounds
+ * are configurable, generic and (with `MessageBeep`) impossible to tell apart from any other program's.
+ * When the device refuses the buffer — a muted output, no audio endpoint at all — the system sound is
+ * used instead so feedback is never silently lost.
  * @param {'start'|'stop'|'done'|'error'} kind - which sound to play.
+ * @param {number} [volume] - 0..1, see {@link playCue}.
  * @returns {void}
  */
-export function beep(kind) {
+export function beep(kind, volume = DEFAULT_CUE_VOLUME) {
+  if (kind !== 'off' && playCue(kind, volume)) return
   const types = { start: 0x40, stop: 0x30, done: 0x40, error: 0x10 }
   try {
     native().MessageBeep(types[kind] ?? 0x40)

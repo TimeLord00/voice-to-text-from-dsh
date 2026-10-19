@@ -62,7 +62,7 @@ export function runDictation(config, engine, options = {}) {
       if (!button?.window?.visible) button?.reveal('hotkey')
     } catch (error) {
       log(`! ${error.message}`)
-      if (dictation.beeps) beep('error')
+      if (dictation.beeps) beep('error', config.beepVolume)
     }
   }
 
@@ -188,11 +188,7 @@ function report(log, result) {
   const where = result.pasted ? `pasted into ${result.target || 'the focused window'}` : result.clipboard ? 'copied to the clipboard' : 'not delivered'
   log(`✔ ${seconds}s audio -> ${inference}ms (${where})`)
   log(result.text ? `  ${result.text}` : '  (no speech recognized)')
-  // The level is the difference between "the microphone was not heard" and "the model did not like what
-  // it heard", and without it the answer is a guess. -30 dBFS is a tenth of full scale.
-  if (!result.text && Number.isFinite(result.peakDbfs) && result.peakDbfs < -30) {
-    log(`  ! the recording is very quiet (peak ${result.peakDbfs.toFixed(1)} dBFS): speak closer to the microphone,`)
-    log('    raise the input level in Windows sound settings, or check which device is the default input')
-  }
+  // The measurement behind an empty result — including whether the voice detector agreed — is logged by
+  // Dictation.finish, which every path goes through, so this only prints the line itself.
   log('')
 }
