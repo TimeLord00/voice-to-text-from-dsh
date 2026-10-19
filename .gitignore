@@ -1,0 +1,22 @@
+# Dependencies and the npm cache install.ps1 points at.
+node_modules/
+.npm-cache/
+
+# Models are downloaded, never committed: `vtt models --fetch` puts ~241 MB here.
+models/
+
+# Runtime output. The tool discards every recording by default, so nothing here is ever part of the
+# program — but a machine that turned keepRecordings on would otherwise publish the user's own voice.
+recordings/
+test-output/
+overlay.log
+
+# Local settings. config.json overrides the defaults for this machine only.
+config.json
+
+# Windows shortcuts created by install.ps1 (they contain absolute paths).
+*.lnk
+
+# Scratch copies of src/ taken before risky edits.
+backup/
+src-backup-*/

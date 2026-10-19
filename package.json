@@ -1,0 +1,42 @@
+{
+  "name": "voice-to-text",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone local speech-to-text for Windows: a floating microphone button next to the text caret, a global hotkey, or an HTTP API. SenseVoice + Silero VAD via sherpa-onnx, Win32 through koffi, no child processes.",
+  "license": "MIT",
+  "keywords": [
+    "speech-to-text",
+    "dictation",
+    "voice-typing",
+    "sensevoice",
+    "sherpa-onnx",
+    "silero-vad",
+    "windows",
+    "koffi"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "win32"
+  ],
+  "bin": {
+    "vtt": "./bin/vtt.mjs"
+  },
+  "scripts": {
+    "doctor": "node ./bin/vtt.mjs doctor",
+    "test": "node ./test/menu-selftest.mjs && node ./test/server-selftest.mjs && node ./test/hotkey-selftest.mjs && node ./test/overlay-selftest.mjs",
+    "test:menu": "node ./test/menu-selftest.mjs",
+    "test:server": "node ./test/server-selftest.mjs",
+    "test:hotkey": "node ./test/hotkey-selftest.mjs",
+    "test:overlay": "node ./test/overlay-selftest.mjs",
+    "listen": "node ./bin/vtt.mjs listen",
+    "dictate": "node ./bin/vtt.mjs dictate",
+    "overlay": "node ./bin/vtt.mjs overlay"
+  },
+  "dependencies": {
+    "koffi": "^3.3.3",
+    "sherpa-onnx-node": "1.13.8"
+  }
+}
