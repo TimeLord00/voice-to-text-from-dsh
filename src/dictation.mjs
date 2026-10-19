@@ -8,7 +8,7 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { ROOT } from './config.mjs'
-import { Microphone, beep, copyText, cueStatus, foregroundWindowTitle, readClipboardText, sendPaste, tempRecordingPath } from './win32.mjs'
+import { Microphone, beep, clearClipboard, clipboardHasData, copyText, cueStatus, foregroundWindowTitle, readClipboardText, sendPaste, targetIsProtected, tempRecordingPath } from './win32.mjs'
 import { canonicalToFloat, describeCanonical, speechActivity, toCanonicalWav } from './wav.mjs'
 import { explainNoSpeech } from './engine.mjs'
 
@@ -23,9 +23,15 @@ export class Dictation {
    * @param {object} config - effective configuration.
    * @param {import('./engine.mjs').SpeechEngine} engine - loaded recognizer.
    * @param {{log?: (line: string) => void, beeps?: boolean, paste?: boolean, clipboard?: boolean,
-   *   onText?: (result: object) => void, onState?: (state: string) => void}} [options]
+   *   restoreClipboard?: boolean, restoreDelayMs?: number, onText?: (result: object) => void,
+   *   onState?: (state: string) => void, readClipboard?: () => (string|null),
+   *   writeClipboard?: (text: string, options?: object) => boolean, clearClipboard?: () => boolean,
+   *   pasteKeys?: () => boolean, clipboardHasData?: () => boolean,
+   *   targetIsProtected?: () => boolean}} [options]
    *   feedback and delivery switches; `onState` reports every transition, which is how the floating
-   *   button (src/overlay.mjs) knows when to change colour.
+   *   button (src/overlay.mjs) knows when to change colour. The clipboard functions are injectable so
+   *   the delivery rules can be tested without touching the real clipboard; they default to the Win32
+   *   implementations in src/win32.mjs.
    */
   constructor(config, engine, options = {}) {
     this.config = config
@@ -34,11 +40,21 @@ export class Dictation {
     this.beeps = options.beeps ?? config.beeps
     this.paste = options.paste ?? true
     this.clipboard = options.clipboard ?? true
+    // Delivery must not leave the recognized text behind in the clipboard: the paste needs it for a
+    // moment, so the contents from just before the write are put back right after (see `deliver`).
+    this.restoreClipboard = options.restoreClipboard ?? config.restoreClipboard !== false
+    this.restoreDelayMs = options.restoreDelayMs ?? config.restoreDelayMs ?? 150
+    this.readClipboard = options.readClipboard ?? readClipboardText
+    this.writeClipboard = options.writeClipboard ?? copyText
+    this.clearClipboard = options.clearClipboard ?? clearClipboard
+    this.pasteKeys = options.pasteKeys ?? sendPaste
+    this.clipboardHasData = options.clipboardHasData ?? clipboardHasData
+    this.targetIsProtected = options.targetIsProtected ?? targetIsProtected
+    this.foregroundTitle = options.foregroundTitle ?? foregroundWindowTitle
     this.state = DictationState.Idle
     this.microphone = null
     this.autoStopTimer = null
     this.lastResult = null
-    this.previousClipboard = null
     this.onText = options.onText ?? null
     this.onState = options.onState ?? null
     /** Set once, so a device that always refuses the cue does not spam the log. @type {boolean} */
@@ -116,7 +132,6 @@ export class Dictation {
     const startedAt = Date.now()
     this.microphone.start()
     const captureMs = Date.now() - startedAt
-    this.previousClipboard = this.clipboard ? readClipboardText() : null
     this.setState(DictationState.Recording)
     this.cue('start')
     // How long the device took to start streaming: the user's "the first time it cannot hear me" is a
@@ -208,22 +223,76 @@ export class Dictation {
   }
 
   /**
-   * Deliver recognized text: clipboard first, then a synthetic Ctrl+V.
+   * Deliver recognized text: clipboard, a synthetic Ctrl+V, and then the clipboard back the way it was.
+   *
+   * The clipboard is the only way into an arbitrary foreign window, so "do not leave my text behind" is
+   * implemented as a restore rather than as an alternative transport: the contents are captured
+   * immediately before the write and put back right after the paste. Four guards keep that honest:
+   * the snapshot is taken as late as possible (something copied during the recording is still the
+   * newest content), the text is only put back when the clipboard still holds exactly our own text (a
+   * copy made while the paste was in flight wins), nothing is put back when the paste did not happen at
+   * all — then the text stays where the user can paste it by hand — and nothing is put back when the
+   * focused window is at a higher integrity level, because Windows ignores synthetic input there and the
+   * clipboard is the user's only way to get the text.
+   *
    * @param {string} text - recognized text.
-   * @returns {Promise<{pasted: boolean, clipboard: boolean, target: string}>} what actually happened.
+   * @returns {Promise<{pasted: boolean, clipboard: boolean, target: string, restored: boolean,
+   *   cleared: boolean, keptText: boolean, keptOther: boolean, targetProtected: boolean}>} what actually
+   *   happened.
    */
   async deliver(text) {
-    const target = foregroundWindowTitle()
-    if (!text) return { pasted: false, clipboard: false, target }
-    const copied = this.clipboard ? copyText(text) : false
-    let pasted = false
+    const target = this.foregroundTitle()
+    const result = { pasted: false, clipboard: false, target, restored: false, cleared: false, keptText: false, keptOther: false, targetProtected: false }
+    if (!text) return result
+    const restore = this.restoreClipboard
+    const previous = this.clipboard && restore ? this.readClipboard() : null
+    // Only text can be read back and restored. What is left when the clipboard held an image or files is
+    // reported instead of being silently dropped.
+    const hadOther = this.clipboard && restore && previous === null ? this.clipboardHasData() : false
+    const copied = this.clipboard ? this.writeClipboard(text, restore ? { excludeFromHistory: true } : undefined) : false
+    result.clipboard = copied
     if (this.paste && copied) {
       // Let the target window settle before injecting the keystroke; the loop stays responsive
       // because finish() is asynchronous.
-      await new Promise((resolve) => setTimeout(resolve, this.config.pasteDelayMs))
-      pasted = sendPaste()
+      await sleep(this.config.pasteDelayMs)
+      result.pasted = this.pasteKeys()
     }
-    return { pasted, clipboard: copied, target }
+    if (!copied || !restore) {
+      result.keptText = copied
+      return result
+    }
+    if (this.readClipboard() !== text) {
+      result.keptOther = true
+      result.keptText = true
+      return result
+    }
+    if (!result.pasted) {
+      // Nothing reached the target window, so the text is deliberately left on the clipboard: taking it
+      // away here would leave the user with no way to use what was just recognized.
+      result.keptText = true
+      return result
+    }
+    if (this.targetIsProtected()) {
+      // Windows blocks synthetic input from a lower integrity level, so the Ctrl+V was probably ignored.
+      // Taking the text off the clipboard here would leave the user with nothing to paste by hand.
+      result.targetProtected = true
+      result.keptText = true
+      this.log('! the focused window runs with higher privileges, so Windows may have ignored the paste;')
+      this.log('  the text is left on the clipboard so you can press Ctrl+V yourself')
+      return result
+    }
+    // The target application reads the clipboard while handling the injected Ctrl+V, which happens after
+    // sendPaste() returns, so the restore waits a moment before pulling the text away.
+    await sleep(this.restoreDelayMs)
+    if (previous !== null) {
+      result.restored = this.writeClipboard(previous)
+      if (!result.restored) this.log('! the clipboard could not be put back; it still holds the recognized text')
+    } else {
+      result.cleared = this.clearClipboard()
+      if (!result.cleared) this.log('! the clipboard could not be emptied; it still holds the recognized text')
+      else if (hadOther) this.log('! the clipboard held something that is not text; it was emptied after the paste')
+    }
+    return result
   }
 
   /** Abandon the current recording without transcribing anything. */
@@ -234,7 +303,6 @@ export class Dictation {
     const seconds = this.elapsedSeconds
     this.microphone?.discard()
     this.microphone?.close()
-    if (this.clipboard && this.previousClipboard !== null) copyText(this.previousClipboard)
     this.setState(DictationState.Idle)
     this.cue('stop')
     this.log(`✕ discarded ${seconds.toFixed(1)}s`)
@@ -249,6 +317,35 @@ export class Dictation {
     this.microphone = null
     this.setState(DictationState.Idle)
   }
+}
+
+/**
+ * One phrase describing what happened to the recognized text, shared by the report line of every
+ * command so the delivery rules read the same everywhere.
+ * @param {object} [delivery] - a `deliver()` (or `finish()`) result.
+ * @returns {string} human-readable summary, without the surrounding parentheses.
+ */
+export function describeDelivery(delivery = {}) {
+  const where = delivery.target || 'the focused window'
+  if (delivery.pasted) {
+    if (delivery.restored) return `pasted into ${where}, clipboard restored`
+    if (delivery.cleared) return `pasted into ${where}, clipboard emptied`
+    if (delivery.keptOther) return `pasted into ${where}, clipboard kept (it changed meanwhile)`
+    if (delivery.targetProtected) return `pasted into ${where} (elevated window: the key press may have been ignored), text left on the clipboard`
+    if (delivery.keptText) return `pasted into ${where}, text left on the clipboard`
+    return `pasted into ${where}`
+  }
+  if (delivery.clipboard) return 'copied to the clipboard'
+  return 'not delivered'
+}
+
+/**
+ * Wait without blocking the event loop.
+ * @param {number} ms - milliseconds to wait.
+ * @returns {Promise<void>} resolved after the delay.
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /**

@@ -7,7 +7,7 @@
  * which drives exactly the same `begin`/`finish`/`discard` transitions — the hotkeys and the button
  * are two front ends on one session, so they can never disagree about what is recording.
  */
-import { Dictation, warmUpMicrophone } from './dictation.mjs'
+import { Dictation, describeDelivery, warmUpMicrophone } from './dictation.mjs'
 import { MicButton } from './overlay.mjs'
 import { Hotkeys, beep, warmUpAudio } from './win32.mjs'
 
@@ -196,8 +196,7 @@ function report(log, result) {
   }
   const seconds = result.audioSeconds.toFixed(1)
   const inference = (result.inferenceSeconds * 1000).toFixed(0)
-  const where = result.pasted ? `pasted into ${result.target || 'the focused window'}` : result.clipboard ? 'copied to the clipboard' : 'not delivered'
-  log(`✔ ${seconds}s audio -> ${inference}ms (${where})`)
+  log(`✔ ${seconds}s audio -> ${inference}ms (${describeDelivery(result)})`)
   log(result.text ? `  ${result.text}` : '  (no speech recognized)')
   // The measurement behind an empty result — including whether the voice detector agreed — is logged by
   // Dictation.finish, which every path goes through, so this only prints the line itself.

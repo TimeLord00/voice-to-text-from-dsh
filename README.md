@@ -11,6 +11,8 @@
 
 > **录音不会留在磁盘上**：每次录音只写一个临时文件，转成 16 kHz 单声道后立刻删除，识别结果只存在于内存里；项目目录里不会出现任何 `.wav`。唯一的例外是你自己显式打开 `keepRecordings`（或 `--keep-recordings`）用于排查问题，见[配置](#配置)。
 
+> **剪贴板也不会被占用**：自动粘贴确实要经过剪贴板，但粘贴一完成就把你原来的内容放回去（原来没有内容就清空）；那一瞬间还会告诉 Windows「别记进 Win+V 历史、别上传云剪贴板」。见[剪贴板不会被占用](#剪贴板不会被占用)。
+
 > TL;DR: 双击项目里的 `Voice to Text (floating button).lnk`（或 `start-overlay.vbs`）→ 光标旁边出现麦克风图标 → 点一下说话，再点一下出字。`vtt doctor` 告诉你哪里不对。
 >
 > English: see [README.en.md](README.en.md) (shorter; this file has the full design notes and troubleshooting).
@@ -207,6 +209,28 @@ wscript.exe "<项目目录>\start-overlay.vbs"
 - `vtt overlay --stop` 分两步：先给按钮发 `WM_CLOSE`（正常退出，会把正在进行的识别做完再走）；消息被 Windows 拦下时，再结束拥有那个窗口的 `node.exe`，并打印它的 PID。只想发消息、绝不结束进程就加 `--no-force`。
 - 通知区域图标需要和 shell 通信：如果进程权限比 shell 低（例如在受限沙箱里运行），`Shell_NotifyIconW` 会以「拒绝访问」失败，日志里会明说原因 —— 正常桌面双击启动不会遇到。
 
+### 剪贴板不会被占用
+
+自动粘贴要靠剪贴板（先放文字，再模拟 `Ctrl+V`），但粘贴**完成后**工具会收尾：
+
+| 粘贴前剪贴板里是 | 粘贴后 |
+| --- | --- |
+| 一段文字 | 原样放回去 |
+| 空 / 只有图片、文件等非文字内容 | 清空（日志会写 `! the clipboard held something that is not text; it was emptied after the paste`） |
+| 在粘贴的这几百毫秒里被你改过 | 不动它（日志写 `clipboard kept (it changed meanwhile)`），不会覆盖你刚复制的东西 |
+| 焦点窗口以管理员权限运行（Windows 会拦下模拟按键） | **文字留在剪贴板里**，日志写 `the focused window runs with higher privileges ...`，你手动 `Ctrl+V` 就能拿到 |
+
+- 写进去的那一瞬间还会带上 Windows 的两个标记（`ExcludeClipboardContentFromMonitorProcessing`、`CanIncludeInClipboardHistory=0`），意思是「**别进 Win+V 历史，也别上传到云剪贴板**」。标记只在粘贴用的那一份上，放回你原来的内容时不带。
+- 所以：**用 Win+V 看不到识别结果，云剪贴板同步也不会把它带走**。你复制过的普通内容照旧进历史。
+- 代价是粘贴前剪贴板里若是一张图，粘贴后它会变成空剪贴板 —— 图片本身（若已粘贴到别处）不受影响，但剪贴板里的那一份留不下来。
+- 老工具（.NET `Clipboard.GetText`、部分 Java/Electron 代码）读剪贴板是「打开即可」的语义，可能比你原来的内容先读到；如果你正好用着这类程序，加 `--no-restore-clipboard`（config `restoreClipboard: false`）就能保持旧行为：文字留在剪贴板里。
+- 粘贴动作本身没变：焦点在哪个窗口，文字就进哪个窗口；`--no-paste`（只放剪贴板，让你自己粘）时**不还原**，因为那时剪贴板就是交付方式。
+
+```powershell
+vtt dictate --no-restore-clipboard      # 不再归还剪贴板，文字留在里面（旧行为）
+vtt dictate --restore-delay 400         # 粘贴后多等一会儿再归还（默认 150 ms）
+```
+
 ---
 
 ## 命令参考
@@ -240,6 +264,8 @@ vtt config  [--init] [--force] [--json]
 | `--speech-margin-db` / `--min-speech-frames` | `16` / `4` | 一段录音里 20 ms 帧要**连续**多少帧高出自身底噪多少 dB，才值得送去识别（`4` 帧 = 80 ms；另有 10 dB / 480 ms 的放宽档兜住又轻又长的整句话）。设 `--speech-margin-db 0` 关掉这道闸门（静音也照解码，用来看模型到底「听」到了什么） |
 | `--beeps` / `--beep-volume` | 开 / `0.35` | 四个自定义水滴提示音的开关与音量（0..1）；`node probe\cue-check.mjs` 可以把它们导出成 wav 试听 |
 | `--keep-recordings` | 关 | 把每次录音留一份到 `recordings\` 用于排查（也支持 `VTT_KEEP_RECORDINGS=1`） |
+| `--restore-clipboard` | 开 | 粘贴完成后把你原来的剪贴板内容放回去（原来没有文字就清空）；`--no-restore-clipboard` 保持旧行为，文字留在剪贴板里。`--no-paste` 时这项无意义 |
+| `--restore-delay` | `150` | 粘贴之后等多少毫秒再归还剪贴板；给读取剪贴板较慢的目标程序留时间 |
 
 退出码：`0` 成功，`1` 运行错误，`3` 没识别到内容，`4` 模型缺失，`5` 自检发现问题。
 
@@ -259,7 +285,9 @@ vtt config  [--init] [--force] [--json]
 vtt dictate
 ```
 
-焦点在哪个窗口，识别结果就会粘贴到哪个窗口。若目标窗口以管理员权限运行，Windows 会拒绝来自普通权限进程的模拟按键（UIPI 限制），此时文字仍在剪贴板里，手动 `Ctrl+V` 即可。
+焦点在哪个窗口，识别结果就会粘贴到哪个窗口。若目标窗口以管理员权限运行，Windows 会拒绝来自普通权限进程的模拟按键（UIPI 限制）——工具检测到这一点时会**把文字留在剪贴板里**并写进日志，你手动 `Ctrl+V` 即可。
+
+> 默认会在粘贴完成后[归还剪贴板](#剪贴板不会被占用)；如果你的目标程序读剪贴板很慢、粘不出来，加 `--no-restore-clipboard`（文字留在剪贴板里）或 `--restore-delay 400`。
 
 ### 3. 只要剪贴板，不要自动粘贴
 
@@ -268,6 +296,8 @@ vtt dictate --no-paste
 ```
 
 适合你不希望工具替你按键的场景；按完热键后自己粘贴。
+
+> 这一种模式下文字**会留在剪贴板里**，因为你还没粘贴。默认（自动粘贴）模式会在粘贴完成后把剪贴板还原成你原来的内容，见[剪贴板不会被占用](#剪贴板不会被占用)。
 
 ### 4. 由别的程序触发（HTTP）
 
@@ -325,6 +355,8 @@ Get-ChildItem *.wav | ForEach-Object { vtt transcribe $_.FullName --json }
   "maxSeconds": 120,
   "minSeconds": 0.6,
   "pasteDelayMs": 120,
+  "restoreClipboard": true,
+  "restoreDelayMs": 150,
   "beeps": true,
   "beepVolume": 0.35,
   "speechMarginDb": 16,
@@ -358,6 +390,8 @@ Get-ChildItem *.wav | ForEach-Object { vtt transcribe $_.FullName --json }
 | `maxSeconds` | 单次录音上限（到点自动结束），默认 120 秒 |
 | `minSeconds` | 短于该时长视为误触，直接丢弃 |
 | `pasteDelayMs` | 粘贴前的等待毫秒数；某些应用需要更大值才能接住按键 |
+| `restoreClipboard` | 粘贴完成后归还剪贴板（默认 `true`）；`false` 则让识别结果留在剪贴板里，等同旧行为 |
+| `restoreDelayMs` | 粘贴之后等多少毫秒再归还（默认 `150`）；给读剪贴板慢的程序留时间 |
 | `keepRecordings` | 把每次录音留一份到 `recordings\`，**只用于排查**「识别为空/识别错」；默认关闭，打开时启动横幅和每次结果都会明确写出来（`! recordings are being kept ...`）。也可用环境变量 `VTT_KEEP_RECORDINGS=1`（给双击快捷方式的场景用） |
 | `beeps` / `beepVolume` | 自定义提示音开关（默认开）与音量（默认 0.35，0..1）。静默超过 6 秒后的第一声会先补 60 ms 静音唤醒输出设备，避免设备省电把整声吃掉 |
 | `speechMarginDb` / `minSpeechFrames` | 「值不值得送去识别」的闸门：20 ms 帧要高出该录音自身底噪多少 dB（默认 16）、并且**连续**多少帧做到（默认 4，即 80 ms）才算有人说话。防的是**静音乱说话**：模型会对着纯底噪编出一句通顺的中文，而悬浮按钮会把这句话粘进你正在写的东西里。另有放宽档（默认 10 dB 连续 480 ms）兜住又轻又长的整句话。设 `speechMarginDb` 为 0 关闭。房间安静时可下调到 12，短而轻的话就不容易被判成「没听到」 |
@@ -420,18 +454,20 @@ DSH 缓存 `%USERPROFILE%\.dsh\speech-to-text\sensevoice\models`。
 
 ## 自检与已验证行为
 
-`npm test` 会跑五组无需人耳的自动化测试（都在本机上跑通）：
+`npm test` 会跑六组无需人耳的自动化测试（都在本机上跑通）：
 
 | 测试 | 覆盖内容 |
 | --- | --- |
 | `npm run test:audio` | 语音闸门：固定底噪 + 已知高度的音块，逐条验证「稳态噪声被拒」「单个采样点的咔哒声不算说话」「220 ms 的短词 20 dB 过关（实测 10 帧）」「60 ms 的咔哒太短」「**240 ms 高出底噪 10 dB 仍被拒**（这条是回归用例：曾经它会被送去解码，模型对着空房间编出一句话）」「800 ms 的轻声靠放宽档过关（实测 31 帧）」「4 dB 仍然被拒」「`marginDb 0` 关闭闸门」「`marginDb 24` 连正常词也拒」，以及默认值就是 16 dB / 4 帧；四个提示音的时长、峰值、首尾静音、两两不同、WAV 头、音量缩放；还有**提示音不会毒死录音器**：先测「播放期间不返回就是异步播放又回来了」，再在一个**带超时的子进程**里跑 `probe\cue-capture-probe.mjs`，先播音再录音，卡死就判失败（详下） |
+| `npm run test:delivery` | 交付与剪贴板：注入式剪贴板把所有规则逐条钉住 —— 有文字就放回去、原来是空的就清空、原来是非文字内容（图片）也清空并说明、粘贴期间被改过就不动、写进去的那一份带「别进历史/别上传」标记而放回去的不带、`restoreClipboard: false` 保持旧行为、`--no-paste` 只放剪贴板不归还；还有 `describeDelivery()` 的四种措辞、归还前的等待（实测 77 ms）；最后**用真实剪贴板**再跑一遍：写入 30 次、读回两次结果一致、标记真的读得到（`{canInclude:0,canUpload:0}`）、归还后内容逐字节等于原值，并把测试开始前你的剪贴板内容放回去 |
 | `npm run test:menu` | 托盘菜单：中文措辞与顺序、命令 id 不重复、隐藏 / 显示文案随状态翻转、提示文字；并把菜单**真的建出来**，用 `GetMenuStringW` 把每项读回来逐字节比对 UTF-16（防止菜单乱码） |
 | `npm run test:server` | 起真实 HTTP 服务：`/health`、`/transcribe`（raw WAV 与 multipart 两种）、`/v1/audio/transcriptions`、参数校验、鉴权 token、404/413/415/400 错误映射、导出、`/dictate` 重复开始冲突、关闭与重启；另有一组 `dictation state machine`：太短的录音「返回 discarded 而不是抛异常」、丢弃后状态回到 idle、连丢两次不留状态、取消回到 idle、**录音设备保存失败时 `finish()` 抛异常但状态仍然是 idle**（旧版本正是卡在这里）、设备拒绝启动时 `begin()` 抛异常也不留状态 |
 | `npm run test:hotkey` | 真实注册全局热键 → 用 PostMessage 投递 WM_HOTKEY → 校验消息泵回调与去重；验证非 WAV 文件被拒；启动真正的 `vtt dictate` 命令确认它是**常驻**的（不会打印完 banner 就退出），并确认停止后进程能自行退出（没有残留句柄） |
 | `npm run test:overlay` | 四个状态的图标像素（尺寸、透明度、可见像素）、放置规则（贴光标 / 靠右翻边 / 无光标退到鼠标 / 不出屏）、跟随规则（鼠标死区内冻结、拖动优先、固定后不再跟随、`hideWithoutCaret` 开关与宽限时间、三条安全兜底）、**拖动判定**（指针真的移动了才算拖动；窗口一直停在指针下面、客户区坐标没变的那种几何也算拖动 —— 这正是「一拖就开始录音」的成因）、通知区域图标（结构体尺寸 1360、渲染、随状态换图、加入与移除、中文菜单项与提示文字、菜单项 id）、真实窗口上的点击 / 悬停 / 拖动 / 右键取消 / 中键只隐藏不退出 / 复活消息，以及**启动真正的 `vtt overlay` 进程**：从外部找到按钮窗口、投递点击、确认识别结果、用中键从外部确认它真的从屏幕上消失（`IsWindowVisible`）再叫回来、再用 `vtt overlay --stop` 关闭并断言退出码是 `0`（不崩溃）；热键被别的进程占用时按钮照样出现 |
 
-其中两组测试各自锁定了一个真实故障：
+其中三组测试各自锁定了一个真实故障：
 
+- **delivery** 组锁定了剪贴板写入失败：同时占着剪贴板的程序（输入法、剪贴板管理器、浏览器）会让 `OpenClipboard` 直接失败。最早一次测量里 30 次写入只成功了 **21 次** —— 也就是说大约每三次粘贴就有一次剪贴板里其实没有文字，只是没人注意到。现在写入、读取、清空都带重试（每次 6 次、间隔 15 ms），同一测量是 30/30。
 - **overlay** 组锁定了崩溃：消息处理是在 Win32 回调栈上执行的，如果在里面直接做录音/推理，进程会以 `0xC0000005` 退出。现在窗口过程只判断「发生了什么」，真正的工作放到下一个事件循环 tick，退出前也会等正在进行的识别落地。
 - **audio** 组锁定了死锁：`PlaySound` 用 `SND_ASYNC` 异步播放时，如果这段声音还没播完就去打开 MCI 录音设备，`mciSendStringW('record')` **永远不会返回** —— 整个进程静静地卡死，没有报错、没有日志、只能去任务管理器结束它（`vtt listen` 第一次跑就复现了：打印完「recording」就再也没动静）。现在提示音一律**同步播放**（最长 233 ms），由构造保证不会残留异步播放状态；`probe\cue-capture-probe.mjs` 把每种播放方式各跑一遍「播放 → 录音 → 保存」，异步的那几种全部卡死、同步的全部通过，测试用例就是它。
 
@@ -474,6 +510,8 @@ node .\bin\vtt.mjs listen --seconds 6      # 对着麦克风说“今天天气�
 | 提示音有时响、有时不响 | 先看日志里有没有 `! the audio device refused the ... cue` 那一行：**有**就是设备真的拒绝了播放（输出被静音、没有输出设备、或那个进程够不到音频服务），此时会退回 Windows 默认提示音（若系统方案的对应项是「无」，那就真的没声）；**没有**就说明播放成功了，只是你听不到 —— 最可能是输出设备省电唤醒（本工具已在静默 6 秒后补 60 ms 静音唤醒，并把水滴音做到 130~330 ms，就是为了让整声活下来）、音量太小、或声音去了另一个输出设备（本机 winmm 报告 2 个输出设备，接耳机/显示器时容易走错）。用 `node probe\cue-device-probe.mjs` 可以把「空闲 / 录音中 / 刚关麦 / 连播四次」各状态下的播放返回值打出来 |
 | 什么都没说，却粘出来一句莫名其妙的话 | 这是模型对纯底噪的**幻觉**（SenseVoice 会对着静音编一句通顺的中文），由 `speechMarginDb` 闸门挡住：没有任何「连续 4 帧（80 ms）」高出底噪 16 dB、也没有「连续 480 ms 高出 10 dB」就不解码，直接报「没识别到」。这道闸门曾经松到 10 dB / 4 帧，结果本机最吵的那一阵底噪（+10 dB 上连续 240 ms）被解码成「花要来长的时候可以用。」—— 所以别把它调得太低。想亲眼看见幻觉：`vtt transcribe recordings\<那次录音>.wav --speech-margin-db 0` |
 | 粘贴没发生，但剪贴板有字 | 目标窗口是管理员权限（UIPI），手动 `Ctrl+V`；或把本工具也以管理员身份运行 |
+| 剪贴板里找不到刚识别的文字 | 这是**故意的**：自动粘贴完成后会把剪贴板还原成你原来的内容（原来没有就清空），并且写进去的那一份带「别进 Win+V 历史、别上传云剪贴板」标记。想改回旧行为（文字留在剪贴板里）加 `--no-restore-clipboard`，或调大 `--restore-delay`（默认 150 ms）给读剪贴板慢的程序留时间。若日志里出现 `! the clipboard could not be put back` / `could not be emptied`，说明你原来的内容还留在里面没被覆盖（另一个程序一直占着剪贴板） |
+| 粘贴后我原来复制的一张图没了 | 剪贴板里只能放一段文字或一个二进制块，图片没法「放回去」，所以粘贴后会被清空 —— 日志会写明 `the clipboard held something that is not text; it was emptied after the paste`。图片本身（已经粘到别处的）不受影响，只是剪贴板里的那一份留不下来。不想清空就用 `--no-restore-clipboard`（那连清空也不会做） |
 | 识别很慢 | 提高线程 `--threads 4`；或改用更短的录音；CPU 推理 1 秒音频通常远快于 1 秒 |
 | 中文夹杂英文识别不准 | `--language auto`；`zh` 会强制按中文解码 |
 | `is not a RIFF/WAVE file` | 只支持 WAV。先用 ffmpeg 转成 `-ar 16000 -ac 1` 的 WAV |
@@ -502,7 +540,7 @@ node .\bin\vtt.mjs listen --seconds 6      # 对着麦克风说“今天天气�
         ↓  重采样 + 混为单声道 → 16 kHz PCM
 Silero VAD 切分 → SenseVoiceSmall (sherpa-onnx, CPU) → 文本
         ↓
-剪贴板 (CF_UNICODETEXT) + 模拟 Ctrl+V
+剪贴板 (CF_UNICODETEXT, 带“别进历史”标记) + 模拟 Ctrl+V → 粘贴完把剪贴板还原
 ```
 
 几个刻意的设计取舍：
@@ -512,6 +550,7 @@ Silero VAD 切分 → SenseVoiceSmall (sherpa-onnx, CPU) → 文本
 - **窗口是「分层窗口」而不是普通窗口**：`WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`，用 `UpdateLayeredWindow` 逐像素画抗锯齿的圆和麦克风图形，鼠标命中由每条 `WM_MOUSEMOVE` 自己算。`WS_EX_NOACTIVATE` 是关键 —— 点按钮**不会抢走焦点**，否则「粘贴到光标处」就无从谈起（焦点一丢，光标就没了）。同一个窗口还带一个 `HTCLIENT` + `MA_NOACTIVATE` 的命中测试，确保点击不会激活它。
 - **画在哪儿不猜**：`GetGUIThreadInfo` 读前台线程的插入符矩形（拿不到就退到鼠标位置），只在光标旁边画。
 - **消息处理不在回调里干活**：窗口过程只记录发生了什么，录音和识别放到下一个事件循环 tick（见上面的崩溃说明）。
+- **剪贴板只是中转站，不是仓库**：识别结果写进剪贴板的那一瞬间带上 `ExcludeClipboardContentFromMonitorProcessing` 与 `CanIncludeInClipboardHistory=0`（**别进 Win+V 历史、别上传云剪贴板**），`Ctrl+V` 注入出去、等 `restoreDelayMs`（默认 150 ms）让目标程序读完，再把你原来的内容放回去（原来没有文字就清空）；期间你若自己复制了东西，检测到内容变了就撒手不管。目标窗口是管理员权限时（UIPI 会吞掉模拟按键）**故意不还原** —— 否则你连手动粘的机会都没有。写入/读取/清空都带重试（8 次、间隔 15 ms）：最早一次测量里 30 次写入只成功 21 次，也就是说大约每三次粘贴就有一次剪贴板里其实没有文字，而这件事没有任何报错。
 - **采集格式固定 48 kHz/16-bit/立体声**。Windows 的 MCI waveaudio 映射器只接受这一种格式（其他采样率/声道组合会返回 MCI 错误 282），而且它会往文件头写错误的 `byteRate`，所以真实格式以 `status` 查询结果为准，转换时显式覆盖。
 - **识别在本地 CPU 上跑**，模型常驻内存（int8 约 250 MB）。首次 `load()` 需要若干秒，之后单次识别是百毫秒级。
 - **静音不乱说话，但长时间的轻说话不能误杀**：识别前先量一遍 20 ms 帧的电平，要求**连续 4 帧（80 ms）高出这段录音自身底噪 16 dB**，否则直接返回空文本（`reason: no-speech-activity`），压根不送模型；另有放宽档（**连续 480 ms 高出 10 dB**）兜住「说得轻但一直在说」的整句话。这条是实测出来的 —— 一段 3 秒的空房间录音被 SenseVoice 解码成了一句通顺的中文「小气自己写就自己写。」，而悬浮按钮会把这句话粘进用户正在写的东西里。判断是**相对**的（跟录音自己的底噪比）而不是绝对音量，所以安静环境里的正常说话不会被误伤。默认值也是量出来的（`node probe\gate-sweep.mjs --synth` / `--cue`，本机实测，同一天不同时刻）：
@@ -550,7 +589,7 @@ voice-to-text/
 ├─ src/server.mjs               本地 HTTP API
 ├─ src/models.mjs               模型查找 / 校验 / 下载
 ├─ src/doctor.mjs               自检
-├─ test/                        五组自检脚本（audio / menu / server / hotkey / overlay）
+├─ test/                        六组自检脚本（audio / delivery / menu / server / hotkey / overlay）
 ├─ probe/                       开发期探针：可复现的测量脚本，非运行时依赖
 ├─ examples/                    其他语言的调用示例（Python / PowerShell / AutoHotkey）
 ├─ LICENSE                      MIT

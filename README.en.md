@@ -64,7 +64,7 @@ node .\bin\vtt.mjs serve --dictate
 ## The floating button
 
 - It sits next to the **text caret** of the focused window (centred on the caret line, flips to the left near the screen edge, always clamped on screen, falls back to the pointer when the window publishes no caret).
-- **Click = start / stop.** It turns red while recording; on stop the audio is transcribed and pasted into the window that had focus. Focus is never stolen — the window is `WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` with `MA_NOACTIVATE`, which is what makes "paste at the caret" possible at all.
+- **Click = start / stop.** It turns red while recording; on stop the audio is transcribed and pasted into the window that had focus, and then your clipboard contents are put back (see [the clipboard](#the-clipboard-is-a-staging-area-not-a-storage-area)). Focus is never stolen — the window is `WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` with `MA_NOACTIVATE`, which is what makes "paste at the caret" possible at all.
 - **It never chases the pointer.** Inside a dead zone around the button (`overlay.pointerFreezePx`, default 8 logical px) nothing moves, so the button can always be clicked.
 - **Drag to park it.** A press that travels ≥ `overlay.dragThresholdPx` (6 px) moves the button instead of toggling; dragging never starts a recording. A parked button stops following the caret until you drag it again or press the hotkey. Follow is also frozen while a press is pending (otherwise the follow tick could move the window between press and release and the release would look like a drag), and only movement *while the press is held* counts — a hand that drifts a few pixels during an ordinary click is still a click.
 - **Double-clicking is safe.** The second click stops a recording shorter than `minSeconds` (0.6 s); that clip is discarded with a "press again and speak a little longer" line and the button is immediately usable again. An earlier build threw out of that branch, left the state machine on `transcribing` and answered every later click with nothing but the error cue — `Dictation.finish()` now resets the state on every exit, and two test suites watch this scene.
@@ -86,7 +86,7 @@ node .\bin\vtt.mjs serve --dictate
 | `vtt doctor` | self-test: platform, models, recognizer, microphone, clipboard, hotkeys |
 | `vtt config [--init]` | show (or write) the effective configuration |
 
-Common flags: `--language zh|en|yue|ja|ko|auto`, `--no-paste` (clipboard only), `--hotkey`, `--cancel-hotkey`, `--max-seconds`, `--threads`, `--json`. Exit codes: `0` ok, `1` error, `3` nothing recognized, `4` models missing, `5` doctor found problems.
+Common flags: `--language zh|en|yue|ja|ko|auto`, `--no-paste` (clipboard only), `--hotkey`, `--cancel-hotkey`, `--max-seconds`, `--threads`, `--restore-clipboard` / `--no-restore-clipboard`, `--restore-delay MS`, `--json`. Exit codes: `0` ok, `1` error, `3` nothing recognized, `4` models missing, `5` doctor found problems.
 
 ## Configuration
 
@@ -102,6 +102,8 @@ Common flags: `--language zh|en|yue|ja|ko|auto`, `--no-paste` (clipboard only), 
   "maxSeconds": 120,
   "minSeconds": 0.6,
   "pasteDelayMs": 120,
+  "restoreClipboard": true,
+  "restoreDelayMs": 150,
   "beeps": true,
   "beepVolume": 0.35,
   "speechMarginDb": 16,
@@ -125,6 +127,22 @@ Common flags: `--language zh|en|yue|ja|ko|auto`, `--no-paste` (clipboard only), 
 - Every recording is written to a temporary file, converted to 16 kHz mono, transcribed and **deleted immediately**. `recordings/` does not exist unless you ask for it.
 - `keepRecordings` (or `--keep-recordings`, or `VTT_KEEP_RECORDINGS=1`) keeps a copy for troubleshooting. It is announced loudly in the banner and on every run, because it means your voice stays on disk.
 - Nothing is uploaded anywhere; the HTTP API binds `127.0.0.1` only and supports an optional bearer token.
+
+## The clipboard is a staging area, not a storage area
+
+Auto-paste has to go through the clipboard (put the text there, inject `Ctrl+V`), but the tool tidies up right after:
+
+| What was on the clipboard | What is there afterwards |
+| --- | --- |
+| some text | that text, put back |
+| nothing, or something that is not text (an image, files) | emptied (the log says `the clipboard held something that is not text; it was emptied after the paste`) |
+| something you copied while the paste was in flight | untouched (`clipboard kept (it changed meanwhile)`) |
+| the focused window runs elevated, so Windows drops the injected key press | **the recognized text stays on the clipboard** (`the focused window runs with higher privileges ...`) so you can press `Ctrl+V` yourself |
+
+- The copy made for the paste also carries `ExcludeClipboardContentFromMonitorProcessing` and `CanIncludeInClipboardHistory=0`, i.e. **it is kept out of the Win+V history and out of cloud clipboard sync**. Only that copy: what is put back for you carries no markers, and ordinary copies you make yourself still enter the history.
+- The cost: if the clipboard held an image, that copy is gone after the paste (any copy you already pasted elsewhere is unaffected); everything else is restored byte for byte.
+- Some older readers (.NET `Clipboard.GetText`, a few Java/Electron code paths) open the clipboard instead of retrying, so they can win the race against your restored content. If you are using one of those, `--no-restore-clipboard` keeps the previous behaviour (the text stays on the clipboard, nothing is restored or cleared).
+- Clipboard access is retried (8 attempts, 15 ms apart) on write, read and clear: in the first measurement only 21 of 30 writes succeeded — roughly every third paste had no text on the clipboard at all, with no error anywhere. The same measurement is 30/30 with the retries.
 
 ## Silence safety (why it does not type nonsense)
 
@@ -162,7 +180,7 @@ They are also played **synchronously**, which is not an accident: with `SND_ASYN
 
 ## Verified on
 
-Windows 10 22H2 (19045) x64, Node 24.19, SenseVoice int8 — real dictation pasted into a browser and an editor, plus a measured room-tone rejection. `npm test` runs five suites (audio gate + cues + the cue/recorder deadlock, HTTP API + dictation state machine, global hotkey + resident process, overlay window/mouse semantics, tray menu structure); `vtt doctor` checks platform, models, recognizer load, microphone capture, clipboard round trip and hotkey registration.
+Windows 10 22H2 (19045) x64, Node 24.19, SenseVoice int8 — real dictation pasted into a browser and an editor, plus a measured room-tone rejection. `npm test` runs six suites (audio gate + cues + the cue/recorder deadlock, delivery + clipboard restore rules, HTTP API + dictation state machine, global hotkey + resident process, overlay window/mouse semantics, tray menu structure); `vtt doctor` checks platform, models, recognizer load, microphone capture, clipboard round trip and hotkey registration.
 
 Two honest caveats: `Shell_NotifyIcon` is refused with `error 5` inside low-integrity sessions (sandboxes, some CI), so the tray icon can only be confirmed on a real desktop — `probe/tray-probe.mjs` tells the two cases apart; and injected mouse/keyboard input is swallowed in some sessions, so the click and drag rules are tested through an injectable pointer seam (`MicButton`'s `pointerAt`) plus posted window messages rather than with synthetic hardware events.
 
@@ -180,6 +198,8 @@ Two honest caveats: `Shell_NotifyIcon` is refused with `error 5` inside low-inte
 | Nothing happens after double-clicking the shortcut | Read `overlay.log` — the first line is a build stamp (version + source mtime), which tells a fresh process apart from an old one. |
 | A cue plays only sometimes | Check the log first: `! the audio device refused the ... cue` means playback was genuinely refused (muted output, no render device, or a process that cannot reach the audio service) and the plain Windows sound takes over — which can itself be set to "(None)". No such line means the cue played and was simply not heard: an output device waking from power save (the tool now prepends 60 ms of silence after 6 s of quiet and keeps drops at 130-330 ms), a low volume slider, or sound routed to another output device (winmm reports two render devices on this machine; headsets and monitors are easy to pick wrongly). |
 | Text lands in the wrong window | Click into the target field first: the paste goes to whatever holds the focus when the recording stops. |
+| The recognized text is not on the clipboard | That is deliberate: auto-paste puts your previous clipboard contents back (or empties it) when the paste is done, and the copy used for the paste is marked "do not keep me" so it stays out of the Win+V history. `--no-restore-clipboard` keeps the old behaviour, `--restore-delay 400` gives a slow reader more time. A log line `! the clipboard could not be put back` means another program is holding the clipboard open, so the text is still there. |
+| An image I had copied is gone after a paste | Only text can be put back; the clipboard is emptied instead and the log says `the clipboard held something that is not text; it was emptied after the paste`. Any copy already pasted elsewhere is unaffected. `--no-restore-clipboard` also skips the clearing. |
 
 ## License and credits
 

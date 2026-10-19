@@ -95,6 +95,16 @@ export const DEFAULTS = {
   minSeconds: 0.6,
   /** Delay between writing the clipboard and injecting Ctrl+V. */
   pasteDelayMs: 120,
+  /**
+   * Put the clipboard back the way it was after a successful paste, instead of leaving the recognized
+   * text in it. The paste itself still needs the clipboard for a moment; with this on, the text is
+   * written with the "do not keep me" markers (Win+V history and cloud clipboard skip it) and the
+   * previous contents are restored right after. Turn it off to keep the old behaviour of leaving the
+   * dictation on the clipboard.
+   */
+  restoreClipboard: true,
+  /** How long to wait after the paste before taking the text back off the clipboard. */
+  restoreDelayMs: 150,
   /** Play the start/stop/result cues. They are synthesized here, not Windows sound-scheme entries. */
   beeps: true,
   /** Loudness of those cues, 0..1. Halved from 0.7 after the user reported them too loud. */

@@ -25,7 +25,27 @@ export const MIC_FORMAT = { sampleRate: 48000, channels: 2, bitsPerSample: 16 }
 
 const GMEM_MOVEABLE = 0x0002
 const CF_UNICODETEXT = 13
+/**
+ * Registered clipboard formats that ask Windows not to keep the content.
+ *
+ * Win+V (clipboard history) and cloud clipboard both check these two formats and skip the item when a
+ * DWORD 0 is present. The dictation path writes them, so text that is pasted and then taken off the
+ * clipboard again never piles up in the history either.
+ */
+const HISTORY_FORMATS = ['CanIncludeInClipboardHistory', 'CanUploadToCloudClipboard']
+/**
+ * The clipboard is a shared resource with a single owner at a time, and other applications hold it for
+ * tens of milliseconds at a time (clipboard managers, browsers, the DSH window). Measured on this
+ * machine: a plain `copyText` failed 9 times out of 30 without retries — and a failed write means the
+ * recognized text is never pasted, which looks like "the tool did nothing". Every clipboard call is
+ * therefore retried while it stays busy.
+ */
+const CLIPBOARD_RETRIES = 8
+/** Wait between those attempts. Worst case a busy clipboard costs ~100 ms before giving up. */
+const CLIPBOARD_RETRY_MS = 15
 const KEYEVENTF_KEYUP = 0x0002
+/** Minimum access needed to ask about another process's integrity level (see {@link targetIsProtected}). */
+const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 const PM_REMOVE = 0x0001
 const WM_HOTKEY = 0x0312
 /** PlaySound flags: our cue lives in memory and must never fall back to a sound-scheme entry. */
@@ -85,13 +105,18 @@ function native() {
     SetClipboardData: user32.func('void *SetClipboardData(unsigned int format, void *memory)'),
     GetClipboardData: user32.func('void *GetClipboardData(unsigned int format)'),
     IsClipboardFormatAvailable: user32.func('int IsClipboardFormatAvailable(unsigned int format)'),
+    CountClipboardFormats: user32.func('int CountClipboardFormats()'),
+    RegisterClipboardFormatW: user32.func('unsigned int RegisterClipboardFormatW(const char16_t *name)'),
     GetForegroundWindow: user32.func('void *GetForegroundWindow()'),
+    GetWindowThreadProcessId: user32.func('unsigned int GetWindowThreadProcessId(void *window, _Out_ unsigned int *processId)'),
     GetWindowTextW: user32.func('int GetWindowTextW(void *window, _Out_ char16_t *text, int maxCount)'),
     keybd_event: user32.func('void keybd_event(unsigned char key, unsigned char scan, unsigned int flags, size_t extra)'),
     MessageBeep: user32.func('int MessageBeep(unsigned int type)'),
     GlobalAlloc: kernel32.func('void *GlobalAlloc(unsigned int flags, size_t bytes)'),
     GlobalLock: kernel32.func('void *GlobalLock(void *memory)'),
     GlobalUnlock: kernel32.func('int GlobalUnlock(void *memory)'),
+    OpenProcess: kernel32.func('void *OpenProcess(unsigned int access, int inherit, unsigned int processId)'),
+    CloseHandle: kernel32.func('int CloseHandle(void *handle)'),
     GetShortPathNameW: kernel32.func('unsigned int GetShortPathNameW(const char16_t *longPath, _Out_ char16_t *shortPath, unsigned int bufferLength)'),
   }
   return libs
@@ -435,11 +460,30 @@ export class Hotkeys {
 
 /**
  * Replace the clipboard contents with the given text.
+ *
  * @param {string} text - text to place on the clipboard.
+ * @param {{excludeFromHistory?: boolean}} [options] - `excludeFromHistory` also tags the item as
+ *   "do not keep me" so Win+V and cloud clipboard skip it (see `HISTORY_FORMATS`).
  * @returns {boolean} whether the clipboard accepted it.
  */
-export function copyText(text) {
-  const { koffi: k, OpenClipboard, EmptyClipboard, CloseClipboard, SetClipboardData, GlobalAlloc, GlobalLock, GlobalUnlock } = native()
+export function copyText(text, options = {}) {
+  const libs = native()
+  for (let attempt = 0; attempt < CLIPBOARD_RETRIES; attempt += 1) {
+    if (writeClipboardText(libs, text, options)) return true
+    if (attempt < CLIPBOARD_RETRIES - 1) sleepTicks(CLIPBOARD_RETRY_MS)
+  }
+  return false
+}
+
+/**
+ * One attempt at replacing the clipboard contents; the caller retries while another process holds it.
+ * @param {object} libs - native bindings.
+ * @param {string} text - text to place on the clipboard.
+ * @param {{excludeFromHistory?: boolean}} options - history markers to write along with it.
+ * @returns {boolean} whether the clipboard accepted it.
+ */
+function writeClipboardText(libs, text, options) {
+  const { koffi: k, OpenClipboard, EmptyClipboard, CloseClipboard, SetClipboardData, GlobalAlloc, GlobalLock, GlobalUnlock } = libs
   if (!OpenClipboard(null)) return false
   try {
     EmptyClipboard()
@@ -452,6 +496,7 @@ export function copyText(text) {
     view[text.length] = 0
     GlobalUnlock(handle)
     if (!SetClipboardData(CF_UNICODETEXT, handle)) return false
+    if (options.excludeFromHistory) markHistoryExcluded(libs)
     return true
   } finally {
     CloseClipboard()
@@ -459,24 +504,135 @@ export function copyText(text) {
 }
 
 /**
+ * Block the thread for a few milliseconds. The clipboard gives no completion event, so polling is the
+ * only way to wait for the application that currently owns it.
+ * @param {number} ms - milliseconds to wait.
+ * @returns {void}
+ */
+function sleepTicks(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/**
+ * Tag whatever is on the clipboard right now as "do not keep me".
+ * @param {object} libs - native bindings; the clipboard must already be open.
+ * @returns {boolean} whether every marker was written.
+ */
+function markHistoryExcluded(libs) {
+  let ok = true
+  for (const name of HISTORY_FORMATS) {
+    const format = libs.RegisterClipboardFormatW(Buffer.from(`${name}\0`, 'utf16le'))
+    ok = format !== 0 && setClipboardDword(libs, format, 0) && ok
+  }
+  return ok
+}
+
+/**
+ * Store a 32-bit value under a registered clipboard format.
+ * @param {object} libs - native bindings; the clipboard must already be open.
+ * @param {number} format - id from `RegisterClipboardFormatW`.
+ * @param {number} value - the DWORD to store.
+ * @returns {boolean} whether the clipboard took it.
+ */
+function setClipboardDword(libs, format, value) {
+  const handle = libs.GlobalAlloc(GMEM_MOVEABLE, 4)
+  if (!handle) return false
+  const pointer = libs.GlobalLock(handle)
+  if (!pointer) return false
+  new Uint32Array(libs.koffi.view(pointer, 4))[0] = value
+  libs.GlobalUnlock(handle)
+  return Boolean(libs.SetClipboardData(format, handle))
+}
+
+/**
+ * Read the history markers currently set on the clipboard, for diagnostics and self-tests.
+ * @returns {{canInclude: number|null, canUpload: number|null}} `0` means "keep this out of the history".
+ */
+export function historyExclusion() {
+  const libs = native()
+  const result = { canInclude: null, canUpload: null }
+  const keys = ['canInclude', 'canUpload']
+  for (let attempt = 0; attempt < CLIPBOARD_RETRIES; attempt += 1) {
+    if (!libs.OpenClipboard(null)) {
+      if (attempt < CLIPBOARD_RETRIES - 1) sleepTicks(CLIPBOARD_RETRY_MS)
+      continue
+    }
+    try {
+      HISTORY_FORMATS.forEach((name, index) => {
+        const format = libs.RegisterClipboardFormatW(Buffer.from(`${name}\0`, 'utf16le'))
+        if (!format || !libs.IsClipboardFormatAvailable(format)) return
+        const handle = libs.GetClipboardData(format)
+        if (!handle) return
+        const pointer = libs.GlobalLock(handle)
+        if (!pointer) return
+        result[keys[index]] = new Uint32Array(libs.koffi.view(pointer, 4))[0]
+        libs.GlobalUnlock(handle)
+      })
+    } finally {
+      libs.CloseClipboard()
+    }
+    return result
+  }
+  return result
+}
+
+/**
+ * Empty the clipboard.
+ * @returns {boolean} whether the clipboard was opened and emptied.
+ */
+export function clearClipboard() {
+  const libs = native()
+  for (let attempt = 0; attempt < CLIPBOARD_RETRIES; attempt += 1) {
+    if (libs.OpenClipboard(null)) {
+      try {
+        return Boolean(libs.EmptyClipboard())
+      } finally {
+        libs.CloseClipboard()
+      }
+    }
+    if (attempt < CLIPBOARD_RETRIES - 1) sleepTicks(CLIPBOARD_RETRY_MS)
+  }
+  return false
+}
+
+/**
+ * Whether the clipboard holds anything at all, text or not.
+ *
+ * The delivery path asks this before overwriting the clipboard: only text can be put back afterwards,
+ * so an image or a set of files is reported to the user instead of being silently dropped.
+ * @returns {boolean} true when at least one format is present.
+ */
+export function clipboardHasData() {
+  const libs = native()
+  if (libs.IsClipboardFormatAvailable(CF_UNICODETEXT)) return true
+  return libs.CountClipboardFormats() > 0
+}
+
+/**
  * Read the clipboard as text.
  * @returns {string|null} clipboard text, or null when it holds no text.
  */
 export function readClipboardText() {
-  const { koffi: k, OpenClipboard, GetClipboardData, GlobalLock, GlobalUnlock, IsClipboardFormatAvailable, CloseClipboard } = native()
+  const libs = native()
+  const { koffi: k, OpenClipboard, GetClipboardData, GlobalLock, GlobalUnlock, IsClipboardFormatAvailable, CloseClipboard } = libs
   if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return null
-  if (!OpenClipboard(null)) return null
-  try {
-    const handle = GetClipboardData(CF_UNICODETEXT)
-    if (!handle) return null
-    const pointer = GlobalLock(handle)
-    if (!pointer) return null
-    const text = k.decode.string16(pointer)
-    GlobalUnlock(handle)
-    return text
-  } finally {
-    CloseClipboard()
+  for (let attempt = 0; attempt < CLIPBOARD_RETRIES; attempt += 1) {
+    if (OpenClipboard(null)) {
+      try {
+        const handle = GetClipboardData(CF_UNICODETEXT)
+        if (!handle) return null
+        const pointer = GlobalLock(handle)
+        if (!pointer) return null
+        const text = k.decode.string16(pointer)
+        GlobalUnlock(handle)
+        return text
+      } finally {
+        CloseClipboard()
+      }
+    }
+    if (attempt < CLIPBOARD_RETRIES - 1) sleepTicks(CLIPBOARD_RETRY_MS)
   }
+  return null
 }
 
 /**
@@ -510,6 +666,31 @@ export function foregroundWindowTitle() {
   const buffer = Buffer.alloc(512 * 2)
   const length = GetWindowTextW(window, buffer, 512)
   return length > 0 ? k.decode.string16(buffer) : ''
+}
+
+/**
+ * Whether the window that currently has focus is out of reach for synthetic input.
+ *
+ * Windows enforces UIPI: a process may not inject input into a window owned by a higher integrity level,
+ * so the paste is silently dropped by an elevated application. The cheapest reliable signal is whether
+ * this process may even ask about the owning process — `OpenProcess` with limited-information rights is
+ * refused for a higher integrity level. The answer is deliberately conservative: any failure counts as
+ * "protected", which only means the text stays on the clipboard, which is the safe direction.
+ * @returns {boolean} true when the focused window probably ignores the injected Ctrl+V.
+ */
+export function targetIsProtected() {
+  const libs = native()
+  const window = libs.GetForegroundWindow()
+  if (!window) return false
+  const buffer = Buffer.alloc(4)
+  libs.GetWindowThreadProcessId(window, buffer)
+  const processId = buffer.readUInt32LE(0)
+  if (!processId) return false
+  if (processId === process.pid) return false
+  const handle = libs.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, processId)
+  if (!handle) return true
+  libs.CloseHandle(handle)
+  return false
 }
 
 /**

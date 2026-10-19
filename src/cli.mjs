@@ -10,12 +10,12 @@ import { existsSync, readFileSync, rmSync, statSync, writeFileSync, appendFileSy
 import { join, resolve } from 'node:path'
 import { createEngine, explainNoSpeech } from './engine.mjs'
 import { DEFAULTS, LANGUAGES, ROOT, loadConfig, readConfigFile, resolveModels } from './config.mjs'
-import { Dictation, keepRecording } from './dictation.mjs'
+import { Dictation, describeDelivery, keepRecording } from './dictation.mjs'
 import { runDictation } from './dictate.mjs'
 import { formatChecks, runDoctor } from './doctor.mjs'
 import { fetchModels, modelStatus, verifyModels } from './models.mjs'
 import { startApiServer } from './server.mjs'
-import { Microphone, beep, copyText, sendPaste, tempRecordingPath } from './win32.mjs'
+import { Microphone, beep, clearClipboard, clipboardHasData, copyText, foregroundWindowTitle, readClipboardText, sendPaste, targetIsProtected, tempRecordingPath } from './win32.mjs'
 import { describeCanonical, toCanonicalWav } from './wav.mjs'
 
 const VERSION = '0.1.0'
@@ -66,6 +66,8 @@ const CONFIG_FLAGS = {
   beepVolume: 'beepVolume',
   keepRecordings: 'keepRecordings',
   pasteDelayMs: 'pasteDelayMs',
+  restoreClipboard: 'restoreClipboard',
+  restoreDelayMs: 'restoreDelayMs',
   idleTimeoutMs: 'idleTimeoutMs',
 }
 
@@ -195,7 +197,7 @@ async function commandTranscribe(positional, flags) {
   }
   const canonical = toCanonicalWav(bytes)
   const result = engine.transcribe(canonical, config.language)
-  const delivery = deliver(result.text, flags)
+  const delivery = await deliver(result.text, flags, config)
   if (flags.json) {
     process.stdout.write(`${JSON.stringify({ file: resolve(file), text: result.text, seconds: result.audioSeconds, inferenceMs: Math.round(result.inferenceSeconds * 1000), segments: result.segments, peakDbfs: Number(result.peakDbfs.toFixed(1)), reason: result.reason ?? null, ...delivery }, null, 2)}\n`)
   } else {
@@ -271,7 +273,7 @@ async function commandListen(positional, flags, overrides) {
     rmSyncSafe(saved.path)
     if (config.keepRecordings) process.stdout.write(`  kept the recording at ${keepRecording(canonical)}\n`)
     const result = engine.transcribe(canonical, config.language)
-    const delivery = deliver(result.text, flags)
+    const delivery = await deliver(result.text, flags, config)
     if (flags.json) {
       process.stdout.write(`${JSON.stringify({ text: result.text, seconds: result.audioSeconds, inferenceMs: Math.round(result.inferenceSeconds * 1000), segments: result.segments, peakDbfs: Number(result.peakDbfs.toFixed(1)), reason: result.reason ?? null, ...delivery }, null, 2)}\n`)
     } else {
@@ -284,8 +286,7 @@ async function commandListen(positional, flags, overrides) {
       } else {
         process.stdout.write(`  level ${result.peakDbfs.toFixed(1)} dBFS\n`)
       }
-      if (delivery.pasted) process.stdout.write(`(pasted into ${delivery.target || 'the focused window'})\n`)
-      else if (delivery.clipboard) process.stdout.write('(copied to the clipboard)\n')
+      if (delivery.pasted || delivery.clipboard) process.stdout.write(`(${describeDelivery(delivery)})\n`)
     }
     return result.text ? 0 : 3
   } finally {
@@ -598,16 +599,58 @@ function flagsToConfig(flags) {
 
 /**
  * Copy and/or paste recognized text according to flags.
+ *
+ * `--copy` means the user wants the text on the clipboard, so it stays there. Only `--paste` without
+ * `--copy` is "put it into the focused window and leave my clipboard alone": that path restores what
+ * the clipboard held before, exactly like the dictation delivery does.
+ *
  * @param {string} text - recognized text.
  * @param {Record<string, any>} flags - parsed flags.
- * @returns {{clipboard: boolean, pasted: boolean}} what was done.
+ * @param {object} [config] - effective configuration (`restoreClipboard`, `restoreDelayMs`).
+ * @returns {Promise<{clipboard: boolean, pasted: boolean, restored: boolean, cleared: boolean,
+ *   keptText: boolean, keptOther: boolean, targetProtected: boolean, target: string}>} what was done.
  */
-function deliver(text, flags) {
-  if (!text) return { clipboard: false, pasted: false }
-  if (!flags.copy && !flags.paste) return { clipboard: false, pasted: false }
-  const copied = copyText(text)
-  const pasted = copied && flags.paste ? sendPaste() : false
-  return { clipboard: copied, pasted }
+async function deliver(text, flags, config = {}) {
+  const empty = { clipboard: false, pasted: false, restored: false, cleared: false, keptText: false, keptOther: false, targetProtected: false, target: '' }
+  if (!text) return empty
+  if (!flags.copy && !flags.paste) return empty
+  const restore = config.restoreClipboard !== false && flags.paste === true && !flags.copy
+  const previous = restore ? readClipboardText() : null
+  const hadOther = restore && previous === null ? clipboardHasData() : false
+  const copied = copyText(text, restore ? { excludeFromHistory: true } : undefined)
+  const result = { ...empty, clipboard: copied, target: foregroundWindowTitle(), targetProtected: false }
+  if (!copied || !flags.paste) {
+    result.keptText = copied
+    return result
+  }
+  result.pasted = sendPaste()
+  if (!restore || !result.pasted) {
+    result.keptText = copied
+    return result
+  }
+  if (readClipboardText() !== text) {
+    result.keptOther = true
+    result.keptText = true
+    return result
+  }
+  if (targetIsProtected()) {
+    // An elevated window ignores synthetic input, so the clipboard is the user's only way to get the text.
+    result.targetProtected = true
+    result.keptText = true
+    process.stdout.write('! the focused window runs with higher privileges, so Windows may have ignored the paste;\n  the text is left on the clipboard so you can press Ctrl+V yourself\n')
+    return result
+  }
+  // The target window reads the clipboard while it handles the injected Ctrl+V, which happens after
+  // sendPaste() returns, so the text is only taken away after a short delay.
+  await sleep(config.restoreDelayMs ?? 150)
+  if (previous !== null) {
+    result.restored = copyText(previous)
+    result.keptText = false
+  } else {
+    result.cleared = clearClipboard()
+    if (hadOther) process.stdout.write('! the clipboard held something that is not text; it was emptied after the paste\n')
+  }
+  return result
 }
 
 /**
@@ -673,6 +716,9 @@ common options
   --threads N                       ONNX Runtime threads (default ${DEFAULTS.threads})
   --hotkey / --cancel-hotkey        global hotkeys for dictation (default ${DEFAULTS.hotkey} / ${DEFAULTS.cancelHotkey})
   --copy / --paste                  send the text to the clipboard / paste into the focused window
+  --restore-clipboard               put the clipboard back after a paste instead of leaving the text in it
+                                    (default ${DEFAULTS.restoreClipboard}); --no-restore-clipboard keeps it
+  --restore-delay MS                how long to wait after the paste before restoring (default ${DEFAULTS.restoreDelayMs})
   --json                            machine-readable output
   --no-beeps                        silence the start/stop/result cues
   --beep-volume 0..1                how loud those cues are (default ${DEFAULTS.beepVolume})
